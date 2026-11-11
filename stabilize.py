@@ -3,7 +3,10 @@
 
 Steps, per hand (left/right label from the tracker):
   1. drop detections with detector score below ``MIN_SCORE``;
-  2. reject wrist jumps larger than ``MAX_JUMP_PX`` between consecutive samples;
+  2. reject poses whose wrist lies outside the hand's own detection box
+     (farther than ``BOX_TOL`` box diagonals from its center); predictions
+     without a box fall back to rejecting wrist jumps larger than
+     ``MAX_JUMP_PX`` between consecutive samples;
   3. split into runs at holes longer than ``MAX_GAP_S``;
   4. repair isolated spikes with a Hampel filter (local median replacement);
   5. smooth each run with a centered Savitzky-Golay filter (zero phase, no lag);
@@ -23,6 +26,7 @@ from scipy.signal import savgol_filter
 
 MIN_SCORE = 0.05
 MAX_JUMP_PX = 200.0
+BOX_TOL = 0.6
 MAX_GAP_S = 1.20
 MAX_FILL_S = 0.30
 SG_WINDOW_S = 0.7
@@ -134,11 +138,22 @@ def build(preds, frame_times, min_score=MIN_SCORE, max_jump=MAX_JUMP_PX,
             kp3 = np.asarray(h["joints_3d"], np.float64)
             if kp2.shape != (21, 2) or kp3.shape != (21, 3):
                 continue
-            raw["R" if h.get("right") else "L"].append(dict(t=t, kp2=kp2, kp3=kp3, score=score))
+            box = h.get("bbox")
+            box = np.asarray(box, np.float64) if box is not None else None
+            raw["R" if h.get("right") else "L"].append(dict(t=t, kp2=kp2, kp3=kp3, score=score, box=box))
     out, stats = {}, {}
     for side in ("L", "R"):
         kept, ref = [], None
         for d in sorted(raw[side], key=lambda d: d["t"]):
+            box = d.pop("box")
+            if box is not None and box.shape == (4,):
+                # The left/right labeling already enforces motion continuity of
+                # the boxes; only reject poses inconsistent with their own box.
+                c = (box[:2] + box[2:]) / 2
+                diag = float(np.hypot(*(box[2:] - box[:2])))
+                if np.linalg.norm(d["kp2"][0] - c) <= BOX_TOL * max(diag, 1.0):
+                    kept.append(d)
+                continue
             gap = (d["t"] - kept[-1]["t"]) if kept else 9.0
             if ref is None or gap > max_gap or np.linalg.norm(d["kp2"][0] - ref) <= max_jump:
                 kept.append(d)

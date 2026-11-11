@@ -1,1 +1,1 @@
-"""EgoForce hand keypoint estimation: YOLO-World + CSRT tracking + AnyHand-WiLoR, with offline stabilization."""
+"""EgoForce hand keypoint estimation: YOLO-World detection + offline left/right labeling + AnyHand-WiLoR, with offline stabilization."""

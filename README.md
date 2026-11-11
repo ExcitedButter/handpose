@@ -14,20 +14,26 @@ Zhi Cao<sup>1,2*</sup>, Yining Hong<sup>2*</sup>, Jiaolong Yang<sup>3</sup>, Yej
 
 ## How it works
 
-1. **Detection and tracking.** YOLO-World (text prompts "white glove", "hand")
-   runs on the full view every `--detect-every` frames. CSRT trackers follow
-   both hands on every frame; a lost hand is searched for in a crop around its
-   last position.
-2. **Hand labels.** A new hand starts on its own screen side (left half: left
-   hand, right half: right hand). Whenever both hands are tracked, the one
-   further right in the image is the right hand, and the two tracks swap labels
-   if they disagree. A single visible hand keeps the label of its track. A hand
-   slot that has not been confirmed by the detector for `--reacquire` seconds
-   is released and may restart on any glove.
+1. **Detection.** YOLO-World (text prompts "white glove", "hand") runs on
+   the full left view of every pose frame (`--pose-hz`). When it returns fewer
+   than two confident boxes, the left 60 % and the right 60 % of the image are
+   searched again at higher effective resolution. A box that covers two other
+   boxes (both hands merged) is dropped. Each candidate also gets the share of
+   white pixels inside it, since the EgoForce gloves are white.
+2. **Hand labels** (`labeling.py`, offline). All candidates of the recording
+   are labeled at once by a Viterbi search over per-frame assignments
+   (left box, right box), each possibly absent. The path cost rewards
+   confident boxes; penalizes boxes with almost no white pixels (sleeves,
+   wristbands), left/right crossing, a hand far on the opposite side of the
+   image, abrupt motion or size changes between frames, and every appearance
+   or disappearance of a hand. Because the search sees the whole recording, a
+   hand that re-enters the view is labeled from the past and the future,
+   not only from the frame where it reappears.
 3. **Pose.** AnyHand-WiLoR regresses MANO parameters, 21 3D joints and their 2D
-   projections for each tracked hand at `--pose-hz`.
+   projections for each labeled hand box at `--pose-hz`.
 4. **Stabilization** (`stabilize.py`, offline, zero phase). Drop detections
-   with score below 0.05; reject wrist jumps above 200 px; split at holes
+   with score below 0.05; reject poses whose wrist lies outside the hand's own
+   box (more than 0.6 box diagonals from its center); split at holes
    longer than 1.2 s; repair spikes with a Hampel filter; smooth with a
    centered Savitzky-Golay filter (0.7 s window, order 2); interpolate onto
    every video frame, never across a hole longer than 0.3 s.
@@ -41,10 +47,10 @@ cd handpose_algorithm
 pip install -r requirements.txt
 ```
 
-Use `opencv-contrib-python`, not `opencv-python`: CSRT tracking is in the
-contrib build. Install the PyTorch build that matches your hardware first if
-you want GPU inference. CPU works but is slow (about 3 frames/s against about
-18 frames/s on a single GPU with `--fp16`).
+Use `opencv-contrib-python`, not `opencv-python`: the lower-level `run.py`
+uses CSRT tracking from the contrib build. Install the PyTorch build that
+matches your hardware first if you want GPU inference. On a GPU with `--fp16`
+we measured about 35 video frames/s per process; CPU works but is much slower.
 
 ## 2. Model weights
 
@@ -170,8 +176,8 @@ if z["R_ok"][i]:
 * `*_mm` are camera-oriented 3D joints (x right, y down, z forward) relative
   to the wrist, at MANO metric scale.
 * `L`/`R` are the wearer's left and right hands, decided as described in
-  "How it works" (geometry plus track continuity, not an anatomical
-  classifier).
+  "How it works" (geometry, appearance and motion continuity over the whole
+  recording, not an anatomical classifier).
 * A raw `.mcap` recording is also accepted as input; then coordinates are in
   native left-image pixels (1920x1200) and `scale` is 1.
 
@@ -179,11 +185,7 @@ if z["R_ok"][i]:
 
 | flag | default | |
 |---|---|---|
-| `--conf` | 0.12 | detector confidence threshold |
-| `--detect-every` | 5 | frames between full-view detections |
-| `--track-max-gap` | 0.6 | seconds a hand survives without detector confirmation |
-| `--reacquire` | 2.0 | seconds after which an unconfirmed hand slot is released |
-| `--pose-hz` | 10 | pose estimation rate before interpolation; 0 = every frame |
+| `--pose-hz` | 10 | detection and pose rate before interpolation; 0 = every frame |
 | `--upscale` | 2.0 | MP4 left-view upscale before inference |
 | `--device` | auto | `cpu`, `cuda` or `auto` |
 | `--fp16` | off | half precision pose model (CUDA) |
@@ -192,7 +194,8 @@ if z["R_ok"][i]:
 | `--save-predictions` | off | single mode: also write raw per-pose predictions (`.jsonl.gz`) |
 | `--overwrite` | off | batch mode: recompute existing outputs |
 
-Stabilizer thresholds are constants at the top of `stabilize.py`.
+Labeling costs and detection thresholds are constants at the top of
+`labeling.py`; stabilizer thresholds are constants at the top of `stabilize.py`.
 `python stabilize.py --preds predictions.jsonl.gz --timestamps timestamps.json`
 re-stabilizes saved predictions and prints statistics.
 
@@ -204,16 +207,18 @@ re-stabilizes saved predictions and prints statistics.
 * Hands are missed when heavily occluded, motion-blurred, at the image border
   or out of view; those frames are `*_ok == False`. Holes up to 0.3 s are
   interpolated, longer ones are left empty.
-* Labels rely on image geometry and tracking. When the hands cross, or only
-  one hand is visible right after a long absence, the label can be wrong
-  until both hands are seen again.
+* Labels rely on image geometry, glove appearance and motion continuity.
+  Long stretches with crossed hands can be labeled the wrong way round.
+* White objects that look like a glove (for example a white sneaker held next
+  to the hands) can be taken for a hand, especially while the real hand is
+  occluded or out of view.
 * The detector is prompted for white gloves; bare hands or other gloves are
   detected less reliably.
 * Detector scores are not joint confidences.
 
 ## Lower-level tools
 
-* `run.py`: detector/tracker/pose runner over raw MCAP files or numbered
+* `run.py`: the earlier frame-by-frame detector/CSRT-tracker/pose runner over raw MCAP files or numbered
   sessions, writing full per-frame predictions (MANO parameters, vertices,
   tracking diagnostics) and optional preview images or videos
   (`python run.py --help`).

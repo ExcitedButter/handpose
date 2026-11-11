@@ -25,12 +25,13 @@ def load_frame_times(recording_dir, key="head"):
 
 
 def iter_mp4_frames(mp4_path, frame_times, *, layout="side-by-side", upscale=2.0,
-                    max_frames=None, threads=2):
+                    max_frames=None, threads=2, keep=None):
     """Yield one VideoFrame per decoded picture, in presentation order.
 
     ``image`` is the left view resized by ``upscale``; ``offset_s`` is the
     matching entry of ``frame_times``. Decoding stops at the shorter of the
-    video and the timestamp list.
+    video and the timestamp list. With ``keep`` (a set of frame indices), only
+    those frames are converted and yielded.
     """
     frame_times = np.asarray(frame_times, np.float64)
     with av.open(str(mp4_path)) as container:
@@ -40,6 +41,8 @@ def iter_mp4_frames(mp4_path, frame_times, *, layout="side-by-side", upscale=2.0
         for index, decoded in enumerate(container.decode(stream)):
             if index >= len(frame_times) or (max_frames is not None and index >= max_frames):
                 break
+            if keep is not None and index not in keep:
+                continue
             stereo = decoded.to_ndarray(format="bgr24")
             h, w = stereo.shape[:2]
             image = left_view(stereo, layout)

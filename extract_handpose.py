@@ -7,7 +7,8 @@ directories, e.g. a date folder; batch outputs mirror the input tree as
 ``<output>/<task>/<collector>/recording_NNN/handpose.npz`` and existing
 outputs are skipped. The pipeline is:
 
-  YOLO-World glove/hand detection + CSRT tracking on every frame
+  YOLO-World glove/hand detection on every pose frame
+  -> offline left/right labeling of the whole recording (labeling.py)
   -> AnyHand-WiLoR (MANO) pose at ``--pose-hz``
   -> zero-phase stabilization (stabilize.py)
   -> one npz with a row per video frame.
@@ -48,16 +49,37 @@ def parse_args(argv=None):
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--fp16", action="store_true", help="Half precision pose model (CUDA only)")
     p.add_argument("--threads", type=int, default=8)
-    p.add_argument("--conf", type=float, default=0.12, help="Detector confidence threshold")
-    p.add_argument("--detect-every", type=int, default=5, help="Frames between full-view detections")
-    p.add_argument("--track-max-gap", type=float, default=0.6, help="Seconds a track may go without detector confirmation")
-    p.add_argument("--reacquire", type=float, default=2.0, help="Seconds after which an unconfirmed hand slot is released")
     p.add_argument("--pose-hz", type=float, default=10.0, help="Pose estimation rate; 0 = every frame")
     p.add_argument("--upscale", type=float, default=2.0, help="MP4 only: left-view upscale before inference")
     p.add_argument("--max-frames", type=int, default=None, help="Process only the first N frames (testing)")
     p.add_argument("--save-predictions", type=Path, default=None, help="Single mode: also write raw per-pose predictions (.jsonl.gz)")
     p.add_argument("--overwrite", action="store_true", help="Batch mode: recompute recordings whose output exists")
     return p.parse_args(argv)
+
+
+def arm_check(preds, frame_wh):
+    """Consistency of left/right labels with the forearm direction.
+
+    The forearm continues the wrist beyond the hand (middle knuckle to wrist).
+    Extended to below the image, the right forearm should end to the right of
+    the left forearm. Returns the share of two-hand pose frames where it does
+    not, by more than a tenth of the image width.
+    """
+    w, h = frame_wh
+    checked = disagree = 0
+    for _, row in preds:
+        entry = {}
+        for hand in row["hands"]:
+            kp = np.asarray(hand["keypoints_2d"], np.float64)
+            v = kp[0] - kp[9]
+            if v[1] <= 0.3 * np.linalg.norm(v):
+                continue
+            entry[int(hand["right"])] = kp[0][0] + v[0] * (1.3 * h - kp[0][1]) / v[1]
+        if len(entry) == 2:
+            checked += 1
+            disagree += int(entry[0] > entry[1] + 0.1 * w)
+    return {"two_hand_frames": checked, "disagree": disagree,
+            "disagree_rate": round(disagree / checked, 4) if checked else None}
 
 
 def find_recordings(root):
@@ -90,8 +112,8 @@ class Pipeline:
 
     def run(self, src, output, save_predictions=None):
         from mcap_video import FrameSampler, iter_left_frames
-        from tracking import HandTracker
         from video_input import iter_mp4_frames, load_frame_times
+        import labeling
         import stabilize
 
         args = self.args
@@ -103,44 +125,65 @@ class Pipeline:
             frame_times = load_frame_times(src)
             if args.max_frames is not None:
                 frame_times = frame_times[:args.max_frames]
-            frames = iter_mp4_frames(mp4, frame_times, upscale=args.upscale, max_frames=args.max_frames)
             scale = 1.0 / args.upscale
+
+            def frames(upscale, keep=None):
+                for f in iter_mp4_frames(mp4, frame_times, upscale=upscale, max_frames=args.max_frames, keep=keep):
+                    yield f.packet_index, f
+            det_scale = args.upscale
         elif src.suffix.lower() == ".mcap":
             frame_times = None
-            frames = iter_left_frames(src, start_s=0.0, all_frames=True, max_frames=args.max_frames)
             scale = 1.0
+
+            def frames(upscale, keep=None):
+                it = iter_left_frames(src, start_s=0.0, all_frames=True, max_frames=args.max_frames)
+                for k, f in enumerate(it):
+                    if keep is None or k in keep:
+                        yield k, f
+            det_scale = 1.0
         else:
             raise ValueError("Input must be a recording directory or an .mcap file")
 
-        tracker = HandTracker(self.detector, conf=args.conf, detect_every=args.detect_every,
-                              max_gap_s=args.track_max_gap, reacquire_s=args.reacquire)
-        sampler = FrameSampler(start_s=0.0, sample_hz=args.pose_hz) if args.pose_hz > 0 else None
-        preds, seen_times = [], []
-        frame_wh, stereo_wh = None, None
-        last_t = None
         started = time.perf_counter()
-        for frame in frames:
+        # Pass 1: candidate boxes on every pose frame (native left view for MP4;
+        # the detector letterboxes to 640 px either way).
+        sampler = FrameSampler(start_s=0.0, sample_hz=args.pose_hz) if args.pose_hz > 0 else None
+        keys, times, cand_boxes, cand_scores, cand_whites = [], [], [], [], []
+        seen_times, frame_wh, stereo_wh, last_t = [], None, None, None
+        for key, frame in frames(1.0):
             seen_times.append(frame.offset_s)
-            frame_wh = (frame.image.shape[1], frame.image.shape[0])
+            frame_wh = (int(round(frame.image.shape[1] * det_scale)), int(round(frame.image.shape[0] * det_scale)))
             stereo_wh = (frame.stereo_width, frame.stereo_height)
-            # Constant-rate MP4s repeat a picture (same timestamp) where the camera
-            # dropped a frame; the tracker needs strictly increasing times.
+            # Constant-rate MP4s repeat a picture (same timestamp) where the
+            # camera dropped a frame; keep strictly increasing times.
             if last_t is not None and frame.offset_s <= last_t:
                 continue
             last_t = frame.offset_s
-            detections, _ = tracker.update(frame.image, frame.offset_s)
             if sampler is not None and not sampler.select(frame.offset_s):
                 continue
-            boxes = np.array([d["bbox"] for d in detections], np.float32).reshape(-1, 4)
-            right = np.array([d["right"] for d in detections])
-            hands = self.extractor.predict_bboxes(frame.image, boxes, right,
-                                                  batch_size=2 if self.device == "cuda" else 1, rescale_factor=2.2)
-            for hand, det in zip(hands, detections):
-                hand["detector_score"] = det["detector_score"]
-                hand["track_id"] = det["track_id"]
-            preds.append((frame.offset_s, {"offset_s": frame.offset_s, "hands": hands}))
+            boxes, scores, whites = labeling.detect_candidates(self.detector, frame.image, scale=det_scale)
+            keys.append(key); times.append(frame.offset_s)
+            cand_boxes.append(boxes); cand_scores.append(scores); cand_whites.append(whites)
         if not seen_times:
             raise ValueError(f"No frames decoded from {src}")
+        lab = labeling.label_hands(np.asarray(times), cand_boxes, cand_scores, width=frame_wh[0], whites=cand_whites)
+
+        # Pass 2: pose for the labeled boxes.
+        wanted = {key: k for k, key in enumerate(keys)}
+        preds = []
+        for key, frame in frames(args.upscale if src.is_dir() else 1.0, keep=set(wanted)):
+            k = wanted.get(key)
+            if k is None:
+                continue
+            boxes, right, score = [], [], []
+            for side, box, sc in ((0, lab.left[k], lab.left_score[k]), (1, lab.right[k], lab.right_score[k])):
+                if box is not None:
+                    boxes.append(box); right.append(side); score.append(sc)
+            hands = self.extractor.predict_bboxes(frame.image, np.array(boxes, np.float32).reshape(-1, 4), np.array(right),
+                                                  batch_size=2 if self.device == "cuda" else 1, rescale_factor=2.2)
+            for hand, sc in zip(hands, score):
+                hand["detector_score"] = sc
+            preds.append((frame.offset_s, {"offset_s": frame.offset_s, "hands": hands}))
 
         if frame_times is None:
             frame_times = np.asarray(seen_times, np.float64)
@@ -167,7 +210,7 @@ class Pipeline:
         return {"input": str(src), "frames": len(frame_times), "poses": len(preds),
                 "elapsed_s": round(time.perf_counter() - started, 1),
                 "coverage_L": round(float(arrs["L_ok"].mean()), 4), "coverage_R": round(float(arrs["R_ok"].mean()), 4),
-                "stabilizer": stats, "output": str(output)}
+                "labeling": lab.stats, "arm_check": arm_check(preds, frame_wh), "stabilizer": stats, "output": str(output)}
 
 
 def main(argv=None):
