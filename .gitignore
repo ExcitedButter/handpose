@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+weights/**/*.ckpt
+weights/**/*.pth
+weights/**/*.pt
+weights/**/*.pkl
+weights/**/*.npz
+weights/**/*.yaml
+weights/**/*.json
+weights/**/*.txt
+!weights/README.md

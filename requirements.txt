@@ -1,0 +1,10 @@
+torch>=2.7
+numpy>=2.0
+opencv-contrib-python>=4.10
+av>=14
+mcap>=1.2
+mcap-protobuf-support>=0.5
+protobuf>=5
+zstandard>=0.23
+lz4>=4.3
+scipy>=1.10

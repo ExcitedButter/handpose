@@ -1,0 +1,13 @@
+{
+  "bundled": {
+    "weights/wilor/anyhand_wilor_nomano.ckpt": "ea29a0d9dd2a37b19cb474d068b784b7aa623c9c507a30be0ceecf1d63adc48b",
+    "weights/wilor/anyhand_model_config_wilor.yaml": "9be1e6e7b51b0d208ec653e9c352a00543430bf127ec1093d5c7c631350b44b1",
+    "weights/yolo_world/yolo_world_v2_m_obj365v1_goldg_pretrain-c6237d5b.pth": "c6237d5b8f6cdc02c7e1a49ebca5ca6af2acb40dcc35908f3ac9eca5bee1120f",
+    "weights/yolo_world/clip-vit-base-patch32/vocab.json": "5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363",
+    "weights/yolo_world/clip-vit-base-patch32/merges.txt": "f526393189112391ce6f9795d4695f704121ce452c3aad1f5335cc41337eba85"
+  },
+  "user_provided": {
+    "weights/mano/MANO_RIGHT.pt": "cd2c4ee21411dc841bd25d3d673819387063eb7696a8bd1676e2a084cdd90664"
+  },
+  "notes": "MANO_RIGHT.pt is created by mano_pkl_to_pt.py from MANO_RIGHT.pkl (mano_v1_2); the hash is that of the tested conversion. anyhand_wilor_nomano.ckpt is the AnyHand-WiLoR checkpoint without MANO tensors and without the training-only discriminator; its outputs are identical to the original checkpoint."
+}
