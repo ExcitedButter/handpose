@@ -14,6 +14,9 @@ optionally absent. The cost of a path combines:
 * geometry: with both hands visible, the left hand is normally to the left of
   the right hand (crossing is allowed but costs), and a hand far on the
   opposite side of the image is mildly penalized;
+* shoe-likeness: white sneakers look like gloves to the glove/hand prompts.
+  The same detector is also queried with "shoe"/"sneaker" prompts; a box that
+  scores clearly higher as a shoe than as a glove is penalized;
 * births and deaths of a hand cost a constant, so short detector misses are
   bridged by the stabilizer instead of producing label changes.
 
@@ -39,9 +42,14 @@ RESIZE = 1.0            # weight on |log area ratio|
 CROSS = 1.5             # left box to the right of the right box
 SIDE = 0.8              # hand on the far opposite side of the image
 OVERLAP_MAX = 0.6       # two hands may not share more than this of the smaller box
-WHITE_MIN = 0.2         # white-pixel share below which a box is penalized
+WHITE_MIN = 0.35        # white-pixel share below which a box is penalized (v7: 0.2 -> 0.35)
 WHITE_PEN = 3.0         # penalty for a box with no white pixels at all
 WHITE_S, WHITE_V = 60, 110   # HSV thresholds of a white pixel (OpenCV scale)
+SHOE_PROMPTS = ("shoe", "sneaker")
+SHOE_MATCH = 0.5        # IoU for a shoe-query box to describe a candidate
+SHOE_MARGIN = 0.15      # shoe score minus glove score where the penalty starts
+SHOE_RANGE = 0.25       # ... and over which it ramps up to SHOE_PEN
+SHOE_PEN = 6.0          # penalty for a box that is clearly a shoe
 
 
 def area(b):
@@ -90,11 +98,29 @@ def _nms(rows, thr=0.5):
     return keep
 
 
-def detect_candidates(detector, image, scale=1.0):
+def shoe_scores(shoe_detector, image, boxes):
+    """Per box: shoe score minus glove score of the best-overlapping prediction of
+    ``shoe_detector`` (YOLO-World prompted with "white glove", "hand", then SHOE_PROMPTS)
+    on the full view; 0 where no prediction overlaps by SHOE_MATCH IoU."""
+    out = np.zeros(len(boxes), np.float32)
+    if shoe_detector is None or not len(boxes):
+        return out
+    pb, ps = shoe_detector.predict_classes(image, conf=0.03)
+    for i, b in enumerate(boxes):
+        best = SHOE_MATCH
+        for q, s in zip(pb, ps):
+            v = iou(b, q)
+            if v > best:
+                best, out[i] = v, float(s[2:].max() - s[:2].max())
+    return out
+
+
+def detect_candidates(detector, image, scale=1.0, shoe_detector=None):
     """Candidate hand boxes on one frame, in coordinates multiplied by ``scale``.
 
-    Returns ``(boxes, scores, whites)``; ``whites`` is the white-pixel share of
-    each box (see :func:`whiteness`).
+    Returns ``(boxes, scores, whites, shoes)``; ``whites`` is the white-pixel
+    share of each box (see :func:`whiteness`), ``shoes`` its shoe-minus-glove
+    score (see :func:`shoe_scores`; zeros without ``shoe_detector``).
 
     The full view is queried first; when it yields fewer than two confident
     boxes, two overlapping halves are queried at higher effective resolution.
@@ -116,7 +142,8 @@ def detect_candidates(detector, image, scale=1.0):
             merged.append(r)
     rows = [r for r in rows if r not in merged][:MAX_CANDIDATES]
     whites = [whiteness(image, r[:4]) for r in rows]
-    return [np.array(r[:4], np.float32) * scale for r in rows], [r[4] for r in rows], whites
+    shoes = shoe_scores(shoe_detector, image, [r[:4] for r in rows])
+    return [np.array(r[:4], np.float32) * scale for r in rows], [r[4] for r in rows], whites, list(shoes)
 
 
 def _bonus(score):
@@ -136,13 +163,19 @@ def _appearance(white):
     return WHITE_PEN * max(0., WHITE_MIN - white) / WHITE_MIN
 
 
-def label_hands(times, boxes, scores, width, whites=None):
-    """Viterbi labeling. ``boxes[k]``/``scores[k]``/``whites[k]`` are the candidates of frame k."""
+def _shoe(shoe):
+    return SHOE_PEN * min(1., max(0., shoe - SHOE_MARGIN) / SHOE_RANGE)
+
+
+def label_hands(times, boxes, scores, width, whites=None, shoes=None):
+    """Viterbi labeling. ``boxes[k]``/``scores[k]``/``whites[k]`` are the candidates of frame k;
+    ``shoes[k]`` their shoe-minus-glove scores (see :func:`shoe_scores`)."""
     n = len(times)
     states, emit = [], []
     for k in range(n):
         b, s = boxes[k], scores[k]
         wk = whites[k] if whites is not None else [1.] * len(b)
+        sk = shoes[k] if shoes is not None else [0.] * len(b)
         st, em = [], []
         idx = range(-1, len(b))
         for i in idx:
@@ -154,10 +187,10 @@ def label_hands(times, boxes, scores, width, whites=None):
                 cost = 0.
                 if i >= 0:
                     x = center(b[i])[0] / width
-                    cost += -_bonus(s[i]) + _appearance(wk[i]) + SIDE * max(0., x - .65) / .35
+                    cost += -_bonus(s[i]) + _appearance(wk[i]) + _shoe(sk[i]) + SIDE * max(0., x - .65) / .35
                 if j >= 0:
                     x = center(b[j])[0] / width
-                    cost += -_bonus(s[j]) + _appearance(wk[j]) + SIDE * max(0., .35 - x) / .35
+                    cost += -_bonus(s[j]) + _appearance(wk[j]) + _shoe(sk[j]) + SIDE * max(0., .35 - x) / .35
                 if i >= 0 and j >= 0 and center(b[i])[0] > center(b[j])[0] + .02 * width:
                     cost += CROSS
                 st.append((i, j))
@@ -204,7 +237,7 @@ def label_hands(times, boxes, scores, width, whites=None):
         path[k] = si
         if k > 0:
             si = int(back[k][si])
-    crossings, missed_two = 0, 0
+    crossings, missed_two, shoe_rejected = 0, 0, 0
     for k in range(n):
         i, j = states[k][path[k]]
         b, s = boxes[k], scores[k]
@@ -216,8 +249,11 @@ def label_hands(times, boxes, scores, width, whites=None):
             crossings += 1
         if sum(x >= STRONG for x in s) >= 2 and (i < 0 or j < 0):
             missed_two += 1
+        if shoes is not None:
+            shoe_rejected += sum(1 for x, v in zip(s, shoes[k]) if x >= STRONG and _shoe(v) >= SHOE_PEN)
     out.stats = {"frames": n, "frames_two_confident": int(sum(sum(x >= STRONG for x in s) >= 2 for s in scores)),
                  "frames_two_confident_one_unassigned": missed_two, "crossed_frames": crossings,
+                 "confident_shoe_like_boxes": shoe_rejected,
                  "left_frames": int(sum(b is not None for b in out.left)),
                  "right_frames": int(sum(b is not None for b in out.right))}
     _smooth_sizes(out.left)

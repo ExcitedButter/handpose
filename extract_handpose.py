@@ -7,7 +7,7 @@ directories, e.g. a date folder; batch outputs mirror the input tree as
 ``<output>/<task>/<collector>/recording_NNN/handpose.npz`` and existing
 outputs are skipped. The pipeline is:
 
-  YOLO-World glove/hand detection on every pose frame
+  YOLO-World glove/hand detection on every pose frame (plus a shoe-vs-glove score per box)
   -> offline left/right labeling of the whole recording (labeling.py)
   -> AnyHand-WiLoR (MANO) pose at ``--pose-hz``
   -> zero-phase stabilization (stabilize.py)
@@ -108,12 +108,16 @@ class Pipeline:
         print(f"Loading models on {device}", flush=True)
         self.args, self.device = args, device
         self.detector = YOLOWorldDetector(device=device)
+        import labeling
+        # Same weights, prompted with shoe classes too: scores boxes that look more like a shoe than a glove.
+        self.shoe_detector = YOLOWorldDetector(device=device, prompts=("white glove", "hand") + labeling.SHOE_PROMPTS)
         self.extractor = WiLoRPoseExtractor(device=device, fp16=args.fp16)
 
     def run(self, src, output, save_predictions=None):
         from mcap_video import FrameSampler, iter_left_frames
         from video_input import iter_mp4_frames, load_frame_times
         import labeling
+        import pose_select
         import stabilize
 
         args = self.args
@@ -148,7 +152,7 @@ class Pipeline:
         # Pass 1: candidate boxes on every pose frame (native left view for MP4;
         # the detector letterboxes to 640 px either way).
         sampler = FrameSampler(start_s=0.0, sample_hz=args.pose_hz) if args.pose_hz > 0 else None
-        keys, times, cand_boxes, cand_scores, cand_whites = [], [], [], [], []
+        keys, times, cand_boxes, cand_scores, cand_whites, cand_shoes = [], [], [], [], [], []
         seen_times, frame_wh, stereo_wh, last_t = [], None, None, None
         for key, frame in frames(1.0):
             seen_times.append(frame.offset_s)
@@ -161,16 +165,19 @@ class Pipeline:
             last_t = frame.offset_s
             if sampler is not None and not sampler.select(frame.offset_s):
                 continue
-            boxes, scores, whites = labeling.detect_candidates(self.detector, frame.image, scale=det_scale)
+            boxes, scores, whites, shoes = labeling.detect_candidates(self.detector, frame.image, scale=det_scale,
+                                                                      shoe_detector=self.shoe_detector)
             keys.append(key); times.append(frame.offset_s)
-            cand_boxes.append(boxes); cand_scores.append(scores); cand_whites.append(whites)
+            cand_boxes.append(boxes); cand_scores.append(scores); cand_whites.append(whites); cand_shoes.append(shoes)
         if not seen_times:
             raise ValueError(f"No frames decoded from {src}")
-        lab = labeling.label_hands(np.asarray(times), cand_boxes, cand_scores, width=frame_wh[0], whites=cand_whites)
+        lab = labeling.label_hands(np.asarray(times), cand_boxes, cand_scores, width=frame_wh[0], whites=cand_whites,
+                                   shoes=cand_shoes)
 
-        # Pass 2: pose for the labeled boxes.
+        # Pass 2: pose hypotheses for the labeled boxes (pose_select.py).
         wanted = {key: k for k, key in enumerate(keys)}
-        preds = []
+        rows = {}
+        track = {0: {}, 1: {}}
         for key, frame in frames(args.upscale if src.is_dir() else 1.0, keep=set(wanted)):
             k = wanted.get(key)
             if k is None:
@@ -179,16 +186,35 @@ class Pipeline:
             for side, box, sc in ((0, lab.left[k], lab.left_score[k]), (1, lab.right[k], lab.right_score[k])):
                 if box is not None:
                     boxes.append(box); right.append(side); score.append(sc)
-            hands = self.extractor.predict_bboxes(frame.image, np.array(boxes, np.float32).reshape(-1, 4), np.array(right),
-                                                  batch_size=2 if self.device == "cuda" else 1, rescale_factor=2.2)
-            for hand, sc in zip(hands, score):
+            kp2, kp3, glove, base = pose_select.hypotheses(self.extractor, frame.image, boxes, right,
+                                                           batch_size=2 if self.device == "cuda" else 1)
+            for i, (hand, sc) in enumerate(zip(base, score)):
                 hand["detector_score"] = sc
-            preds.append((frame.offset_s, {"offset_s": frame.offset_s, "hands": hands}))
+                track[right[i]][k] = (kp2[i], kp3[i], glove[i], hand)
+            rows[k] = frame.offset_s
+        # Offline choice of one hypothesis per sample, per hand and per run of consecutive samples.
+        chosen = {}
+        for side, samples in track.items():
+            ks = sorted(samples)
+            runs = [[]]
+            for k in ks:
+                if runs[-1] and k - runs[-1][-1] > 1:
+                    runs.append([])
+                runs[-1].append(k)
+            for run in (r for r in runs if r):
+                c = pose_select.select(np.stack([samples[k][0] for k in run]), np.stack([samples[k][1] for k in run]),
+                                       np.stack([samples[k][2] for k in run]), bool(side))
+                for k, h in zip(run, c):
+                    kp2, kp3, _, hand = samples[k]
+                    hand = dict(hand, keypoints_2d=kp2[h], joints_3d=kp3[h], hypothesis=int(h))
+                    chosen.setdefault(k, []).append(hand)
+        preds = [(rows[k], {"offset_s": rows[k], "hands": chosen.get(k, [])}) for k in sorted(rows)]
+        hyp_counts = np.bincount([h["hypothesis"] for _, r in preds for h in r["hands"]], minlength=pose_select.N_HYP)
 
         if frame_times is None:
             frame_times = np.asarray(seen_times, np.float64)
         frame_times = np.asarray(frame_times[:len(seen_times)], np.float64)
-        stab, stats = stabilize.build(preds, frame_times)
+        stab, stats = stabilize.build(preds, frame_times, frame_wh=frame_wh)
         arrs = stabilize.to_arrays(stab, frame_times, scale=scale)
         resized_wh = stereo_wh if src.is_dir() else frame_wh
         output = Path(output)
@@ -201,7 +227,7 @@ class Pipeline:
         if save_predictions is not None:
             def plain(v):
                 return v.tolist() if isinstance(v, np.ndarray) else (v.item() if isinstance(v, np.generic) else v)
-            keep = ("right", "track_id", "detector_score", "keypoints_2d", "joints_3d", "cam_t", "bbox")
+            keep = ("right", "track_id", "detector_score", "keypoints_2d", "joints_3d", "cam_t", "bbox", "hypothesis")
             with gzip.open(save_predictions, "wt") as f:
                 for _, row in preds:
                     hands = [{k: plain(v) for k, v in h.items() if k in keep} for h in row["hands"]]
@@ -210,7 +236,9 @@ class Pipeline:
         return {"input": str(src), "frames": len(frame_times), "poses": len(preds),
                 "elapsed_s": round(time.perf_counter() - started, 1),
                 "coverage_L": round(float(arrs["L_ok"].mean()), 4), "coverage_R": round(float(arrs["R_ok"].mean()), 4),
-                "labeling": lab.stats, "arm_check": arm_check(preds, frame_wh), "stabilizer": stats, "output": str(output)}
+                "labeling": lab.stats,
+                "pose_hypotheses_chosen": dict(zip(("box", "refit", "rotated", "mirror_alt"), map(int, hyp_counts))),
+                "arm_check": arm_check(preds, frame_wh), "stabilizer": stats, "output": str(output)}
 
 
 def main(argv=None):

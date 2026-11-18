@@ -4,7 +4,10 @@
 Steps, per hand (left/right label from the tracker):
   1. drop detections with detector score below ``MIN_SCORE``;
   2. reject poses whose wrist lies outside the hand's own detection box
-     (farther than ``BOX_TOL`` box diagonals from its center); predictions
+     (farther than ``BOX_TOL`` box diagonals from its center); a box that
+     touches the image border is first extended past that border by its own
+     size, because a hand cut off by the frame has its wrist outside the image;
+     predictions
      without a box fall back to rejecting wrist jumps larger than
      ``MAX_JUMP_PX`` between consecutive samples;
   3. split into runs at holes longer than ``MAX_GAP_S``;
@@ -27,6 +30,7 @@ from scipy.signal import savgol_filter
 MIN_SCORE = 0.05
 MAX_JUMP_PX = 200.0
 BOX_TOL = 0.6
+EDGE_PX = 4.0    # a box side within this many pixels of the image border touches it
 MAX_GAP_S = 1.20
 MAX_FILL_S = 0.30
 SG_WINDOW_S = 0.7
@@ -123,8 +127,17 @@ def smooth_run(run, win_s=SG_WINDOW_S, poly=SG_POLY):
     return [dict(t=run[i]["t"], kp2=S2[i], kp3=S3[i], score=run[i]["score"]) for i in range(n)]
 
 
+def extend_at_border(box, frame_wh):
+    """Extend the sides of a box that touch the image border outward by the box size."""
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    W, H = frame_wh
+    return np.array([x0 - w if x0 <= EDGE_PX else x0, y0 - h if y0 <= EDGE_PX else y0,
+                     x1 + w if x1 >= W - EDGE_PX else x1, y1 + h if y1 >= H - EDGE_PX else y1])
+
+
 def build(preds, frame_times, min_score=MIN_SCORE, max_jump=MAX_JUMP_PX,
-          win_s=SG_WINDOW_S, poly=SG_POLY, max_gap=MAX_GAP_S, max_fill=MAX_FILL_S):
+          win_s=SG_WINDOW_S, poly=SG_POLY, max_gap=MAX_GAP_S, max_fill=MAX_FILL_S, frame_wh=None):
     """Return ({'L': frames, 'R': frames}, stats); each frame is dict(t, kp2, kp3, score)."""
     raw = {"L": [], "R": []}
     dropped = 0
@@ -147,6 +160,8 @@ def build(preds, frame_times, min_score=MIN_SCORE, max_jump=MAX_JUMP_PX,
         for d in sorted(raw[side], key=lambda d: d["t"]):
             box = d.pop("box")
             if box is not None and box.shape == (4,):
+                if frame_wh is not None:
+                    box = extend_at_border(box, frame_wh)
                 # The left/right labeling already enforces motion continuity of
                 # the boxes; only reject poses inconsistent with their own box.
                 c = (box[:2] + box[2:]) / 2

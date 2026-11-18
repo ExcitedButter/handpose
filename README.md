@@ -19,21 +19,40 @@ Zhi Cao<sup>1,2*</sup>, Yining Hong<sup>2*</sup>, Jiaolong Yang<sup>3</sup>, Yej
    than two confident boxes, the left 60 % and the right 60 % of the image are
    searched again at higher effective resolution. A box that covers two other
    boxes (both hands merged) is dropped. Each candidate also gets the share of
-   white pixels inside it, since the EgoForce gloves are white.
+   white pixels inside it, since the EgoForce gloves are white, and a shoe
+   score: the same YOLO-World weights are queried once more on the full view
+   with the prompts "white glove", "hand", "shoe", "sneaker", and the
+   candidate gets the shoe score minus the glove score of the overlapping
+   prediction (white sneakers otherwise pass as gloves).
 2. **Hand labels** (`labeling.py`, offline). All candidates of the recording
    are labeled at once by a Viterbi search over per-frame assignments
    (left box, right box), each possibly absent. The path cost rewards
-   confident boxes; penalizes boxes with almost no white pixels (sleeves,
-   wristbands), left/right crossing, a hand far on the opposite side of the
+   confident boxes; penalizes boxes with little white (white share below
+   35%: sleeves, wristbands, knee pads), boxes that score clearly higher as a shoe than as a glove,
+   left/right crossing, a hand far on the opposite side of the
    image, abrupt motion or size changes between frames, and every appearance
    or disappearance of a hand. Because the search sees the whole recording, a
    hand that re-enters the view is labeled from the past and the future,
    not only from the frame where it reappears.
-3. **Pose.** AnyHand-WiLoR regresses MANO parameters, 21 3D joints and their 2D
-   projections for each labeled hand box at `--pose-hz`.
+3. **Pose** (`pose_select.py`). AnyHand-WiLoR regresses MANO parameters, 21
+   3D joints and their 2D projections for each labeled hand box at
+   `--pose-hz`. The network sometimes returns the mirror-image solution (palm
+   and back swapped, thumb on the wrong side), mostly for right hands seen
+   edge-on or as a fist. Each hand therefore gets four pose hypotheses: the
+   labeled box, a box refit to the predicted keypoints, the refit box on an
+   image rotated by 25 degrees, and the mirror-image alternative (opposite
+   handedness flag, reflected across its own palm plane). A Viterbi search
+   over the recording picks one hypothesis per sample: it rewards skeletons
+   that lie on the white glove, meshes that cover the glove around the hand,
+   and agreement with the other hypotheses; it prefers the back of the hand
+   toward the head camera (graded, so edge-on hands are not forced either
+   way), and penalizes changes of hand shape, wrist jumps and clear palm flips
+   between samples.
 4. **Stabilization** (`stabilize.py`, offline, zero phase). Drop detections
    with score below 0.05; reject poses whose wrist lies outside the hand's own
-   box (more than 0.6 box diagonals from its center); split at holes
+   box (more than 0.6 box diagonals from its center; a box that touches the
+   image border is first extended past it by its own size, since a hand cut
+   off by the frame has its wrist outside the image); split at holes
    longer than 1.2 s; repair spikes with a Hampel filter; smooth with a
    centered Savitzky-Golay filter (0.7 s window, order 2); interpolate onto
    every video frame, never across a hole longer than 0.3 s.
@@ -50,7 +69,8 @@ pip install -r requirements.txt
 Use `opencv-contrib-python`, not `opencv-python`: the lower-level `run.py`
 uses CSRT tracking from the contrib build. Install the PyTorch build that
 matches your hardware first if you want GPU inference. On a GPU with `--fp16`
-we measured about 35 video frames/s per process; CPU works but is much slower.
+we measured about 15 video frames/s per process (four pose hypotheses per
+hand); CPU works but is much slower.
 
 ## 2. Model weights
 
@@ -120,7 +140,7 @@ python extract_handpose.py /data/EgoForce/20260902/Pour_water/BNN_2828_E_01/reco
     --output recording_001_handpose.npz --device cuda --fp16
 ```
 
-A one-minute recording takes about 100 s on one GPU. For a quick check, add
+A one-minute recording takes about 2 minutes on one GPU. For a quick check, add
 `--max-frames 300`. The command prints per-hand coverage and stabilizer
 statistics.
 
@@ -209,9 +229,11 @@ re-stabilizes saved predictions and prints statistics.
   interpolated, longer ones are left empty.
 * Labels rely on image geometry, glove appearance and motion continuity.
   Long stretches with crossed hands can be labeled the wrong way round.
-* White objects that look like a glove (for example a white sneaker held next
-  to the hands) can be taken for a hand, especially while the real hand is
-  occluded or out of view.
+* White objects that look like a glove can be taken for a hand, especially
+  while the real hand is occluded or out of view. White sneakers are
+  recognized by the shoe score and rejected; when a glove holds a shoe and one
+  box covers both, that hand may be dropped for a few frames rather than
+  mislabeled.
 * The detector is prompted for white gloves; bare hands or other gloves are
   detected less reliably.
 * Detector scores are not joint confidences.

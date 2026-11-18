@@ -189,3 +189,15 @@ class YOLOWorldDetector:
         selected_boxes = selected_boxes[keep]
         selected_scores = selected_scores[keep]
         return np.concatenate([selected_boxes.astype(np.float32), selected_scores[:, None]], axis=1)
+
+    @torch.inference_mode()
+    def predict_classes(self, image_bgr: np.ndarray, *, conf: float = 0.03) -> tuple[np.ndarray, np.ndarray]:
+        """All predictions whose best class score reaches ``conf``, without NMS:
+        boxes ``(N, 4)`` in image pixels and per-prompt scores ``(N, len(prompts))``."""
+        boxed, meta = letterbox_image(image_bgr, self.input_size)
+        image = torch.from_numpy(boxed[:, :, ::-1].copy()).to(self.device).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        scores_t, boxes_t = self.model(image, self.text_features)
+        scores = scores_t[0].detach().cpu().numpy().astype(np.float32)
+        boxes = boxes_t[0].detach().cpu().numpy().astype(np.float32)
+        keep = scores.max(axis=1) >= float(conf)
+        return scale_boxes_to_original(boxes[keep], meta), scores[keep]
