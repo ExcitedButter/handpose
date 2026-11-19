@@ -411,7 +411,6 @@ The run stored in `results/` (detector adapted in two rounds) scores as
 follows; the second column is the same pipeline with WiLoR's detector as
 shipped (`pass0` above).
 
-<!-- RESULTS:BEGIN -->
 | Sample | Recall, WiLoR's detector | Recall, adapted (found / labeled) | Precision, adapted (false skeletons) | Left/right correct | Partly visible hands with a skeleton |
 |---|---|---|---|---|---|
 | `mono_video_only/B02` | 93.3 % | 96.6 % (115 / 119) | 97.5 % (3) | 115 / 115 | 39 / 59 |
@@ -425,8 +424,8 @@ shipped (`pass0` above).
 | all eight | 95.2 % (690 / 725); precision 98.3 % (12), left/right 676 / 689, partly visible 100 / 170 | 98.9 % (717 / 725) | 98.8 % (9) | 715 / 716 | 125 / 170 |
 | `H02`, `mono/case0`, `stereo/case0`, `mono/case10`, `mono/case30`, `stereo/case40` (counts) | 100 % | 100 % (488 / 488) | 100 % (0) | not labeled | |
 
-On the 10 fisheye samples the adapted detector changes the coverage of a hand by at most 1.9 %.
-The stereo samples, fused from both cameras:
+On the 10 fisheye samples the adapted detector changes the coverage of a hand
+by at most 1.9 %. The stereo samples, fused from both cameras:
 
 | Sample | Reprojection error in the second view, left / right | Mono depth against triangulated depth, left / right |
 |---|---|---|
@@ -434,14 +433,12 @@ The stereo samples, fused from both cameras:
 | `stereo/case22` | 3.2 / 2.9 px | 4.0 / 3.9 % |
 | `stereo/case40` | 2.7 / 6.2 px | 2.7 / 7.7 % |
 | `stereo/case55` | 4.3 / 5.5 px | 2.2 / 2.5 % |
-<!-- RESULTS:END -->
 
 Coverage, the share of all frames of a video with a skeleton, also counts the
 frames in which the hand is not in the picture, and in several of these videos
 that is most of the time. The labels say how often a hand is in view; it
 cannot be covered more often than that. `score.py` prints both:
 
-<!-- COVERAGE:BEGIN -->
 | Sample | Frames with a skeleton, left / right | Hand in view at least partly, left / right | Hand clearly visible, left / right |
 |---|---|---|---|
 | `mono/case0` | 67.4 % / 68.3 % | both hands together: 69.6 % (counts) | |
@@ -463,7 +460,6 @@ cannot be covered more often than that. `score.py` prints both:
 | `mono_video_only/H18` | 99.4 % / 93.0 % | 100.0 % / 93.3 % | 96.7 % / 80.0 % |
 | `mono_video_only/L04` | 35.3 % / 34.7 % | 35.8 % / 40.0 % | 22.1 % / 22.1 % |
 | `mono_video_only/L07` | 30.7 % / 79.1 % | 33.9 % / 86.4 % | 20.3 % / 57.6 % |
-<!-- COVERAGE:END -->
 
 Where coverage exceeds the share in view, the difference is sampling (the
 labels cover every 8th to 15th frame) and the few false skeletons.
@@ -476,20 +472,23 @@ How far these numbers carry:
   `B06` and `B21` together reached 295 of 330 hands with 12 false skeletons,
   against 296 and 8 with WiLoR's detector: no gain. New videos need their own
   adaptation rounds.
-* <!-- ONE_ROUND -->After one round the eight videos reach 714 of 725 hands with 9 false skeletons, after two 717 with 9. A third round, and
-  stronger shift augmentation in the training, changed single videos by a
-  few hands but not the total. A few hands per video move with the training
-  set.
+* After one round the eight videos reach 714 of 725 hands with 9 false
+  skeletons, after two 717 with 9; `B06` goes from 83.7 % to 92.9 % to
+  96.9 %. A third round, tried on the detector of the previous version,
+  changed single videos by a few hands but not the total, and stronger shift
+  augmentation in the training cost three hands and added three false
+  skeletons. A few hands per video move with the training set.
 * After adaptation the left/right votes come from a detector that learned
   the names from the pipeline's own labels. They correct stretches that
   deviate from the rest of a video; a video labeled the wrong way round as a
   whole stays that way unless the handedness trial catches it.
-* The remaining misses are hands inside a plastic bag, very close to the
-  camera or pressed against the other hand (`B02`, `B06`, `B21`); the false
-  skeletons lie on plastic bags and on hands that are almost outside the
-  picture (`B02`, `B47`) and on a glass on the bar top (`L07`). Raising the
-  number of keypoints that must lie inside the picture removes some of the
-  latter and as many partly visible hands with them.
+* The remaining misses are gloved hands under a plastic bag or small behind
+  the other arm (`B02`) and hands very close to the camera (`B06`, `B21`);
+  the false skeletons lie on a plastic bag and next to a cleaver whose hand
+  is outside the picture (`B02`), at the image border (`B47`) and on a glass
+  on the bar top (`L07`). Raising the number of keypoints that must lie
+  inside the picture removes some of the border cases and as many partly
+  visible hands with them.
 
 ## Lower-level tools
 
