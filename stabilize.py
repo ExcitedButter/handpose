@@ -10,7 +10,9 @@ Steps, per hand (left/right label from the tracker):
      predictions
      without a box fall back to rejecting wrist jumps larger than
      ``MAX_JUMP_PX`` between consecutive samples;
-  3. split into runs at holes longer than ``MAX_GAP_S``;
+  3. split into runs at holes longer than ``MAX_GAP_S`` (and, with ``max_step``,
+     where the hand jumps or changes size abruptly: the label moved to another
+     hand or object);
   4. repair isolated spikes with a Hampel filter (local median replacement);
   5. smooth each run with a centered Savitzky-Golay filter (zero phase, no lag);
   6. interpolate onto the video frame times, never across a hole longer than
@@ -35,6 +37,9 @@ MAX_GAP_S = 1.20
 MAX_FILL_S = 0.30
 SG_WINDOW_S = 0.7
 SG_POLY = 2
+# only with max_step (see build):
+MAX_SIZE_RATIO = 1.6   # a larger change of the hand's extent between two samples starts a new run
+MAX_SMOOTH_DEV = 0.3   # hand sizes; a sample that smoothing would move farther keeps its measured pose
 
 
 def load(path):
@@ -101,16 +106,29 @@ def hampel(A, k=5, nsig=3.0):
     return out, fixed
 
 
-def split_runs(seq, max_gap):
+def jumped(a, b, max_step):
+    """True when sample ``b`` cannot be the hand of the previous sample ``a``: its center is farther
+    away than ``max_step`` hand sizes per 0.1 s, or its extent differs by more than MAX_SIZE_RATIO."""
+    if max_step is None:
+        return False
+    sa, sb = max(float(np.ptp(a["kp2"], axis=0).max()), 1.0), max(float(np.ptp(b["kp2"], axis=0).max()), 1.0)
+    return (float(np.linalg.norm(b["kp2"].mean(0) - a["kp2"].mean(0))) > max_step * min(sa, sb) * max(1.0, (b["t"] - a["t"]) / 0.1)
+            or max(sa, sb) / min(sa, sb) > MAX_SIZE_RATIO)
+
+
+def split_runs(seq, max_gap, max_step=None):
     runs = [[]]
     for d in seq:
-        if runs[-1] and d["t"] - runs[-1][-1]["t"] > max_gap:
+        if runs[-1] and (d["t"] - runs[-1][-1]["t"] > max_gap or jumped(runs[-1][-1], d, max_step)):
             runs.append([])
         runs[-1].append(d)
     return [r for r in runs if r]
 
 
-def smooth_run(run, win_s=SG_WINDOW_S, poly=SG_POLY):
+def smooth_run(run, win_s=SG_WINDOW_S, poly=SG_POLY, max_dev=None):
+    """Savitzky-Golay smoothing of one run. With ``max_dev`` (hand sizes), a sample whose smoothed
+    pose lies farther than that from its measured pose keeps the measured one: the filter overshoots
+    at the ends of a short or jittery run and would report a hand where none was seen."""
     n = len(run)
     if n < 5:
         return [dict(d) for d in run]
@@ -124,6 +142,9 @@ def smooth_run(run, win_s=SG_WINDOW_S, poly=SG_POLY):
     K3 = np.stack([d["kp3"] for d in run])
     S2 = savgol_filter(K2, w, poly, axis=0, mode="interp")
     S3 = savgol_filter(K3, w, poly, axis=0, mode="interp")
+    if max_dev is not None:
+        dev = np.linalg.norm(S2 - K2, axis=2).mean(1) / np.maximum(np.ptp(K2, axis=1).max(1), 1.0)
+        S2[dev > max_dev], S3[dev > max_dev] = K2[dev > max_dev], K3[dev > max_dev]
     return [dict(t=run[i]["t"], kp2=S2[i], kp3=S3[i], score=run[i]["score"]) for i in range(n)]
 
 
@@ -137,8 +158,18 @@ def extend_at_border(box, frame_wh):
 
 
 def build(preds, frame_times, min_score=MIN_SCORE, max_jump=MAX_JUMP_PX,
-          win_s=SG_WINDOW_S, poly=SG_POLY, max_gap=MAX_GAP_S, max_fill=MAX_FILL_S, frame_wh=None):
-    """Return ({'L': frames, 'R': frames}, stats); each frame is dict(t, kp2, kp3, score)."""
+          win_s=SG_WINDOW_S, poly=SG_POLY, max_gap=MAX_GAP_S, max_fill=MAX_FILL_S, frame_wh=None, max_step=None,
+          hold=0.0):
+    """Return ({'L': frames, 'R': frames}, stats); each frame is dict(t, kp2, kp3, score).
+
+    ``max_step`` (hand sizes per 0.1 s, default off) is for detections that flicker and labels
+    that can move to another hand: consecutive samples farther apart than this (see ``jumped``)
+    start a new run, so they are neither smoothed together nor interpolated across; smoothing may
+    not move a sample by more than MAX_SMOOTH_DEV hand sizes; and every sample is reported on its
+    own frame, including the first one after a hole. A frame that is not interpolated (before or
+    after a run, between two runs, inside a hole longer than ``max_fill``) takes the pose of the
+    nearest sample when that is at most ``hold`` seconds away.
+    """
     raw = {"L": [], "R": []}
     dropped = 0
     for t, row in preds:
@@ -175,36 +206,48 @@ def build(preds, frame_times, min_score=MIN_SCORE, max_jump=MAX_JUMP_PX,
                 ref = d["kp2"][0]
         pre2 = med_step(kept, "kp2")
         nfix = 0
-        for run in split_runs(kept, max_gap):
+        runs = split_runs(kept, max_gap, max_step)
+        for run in runs:
             if len(run) >= 11:
                 H2, a2 = hampel(np.stack([d["kp2"] for d in run]))
                 H3, a3 = hampel(np.stack([d["kp3"] for d in run]))
                 nfix += a2 + a3
                 for i, d in enumerate(run):
                     d["kp2"], d["kp3"] = H2[i], H3[i]
-        sm, lags = [], []
-        for run in split_runs(kept, max_gap):
-            f = smooth_run(run, win_s, poly)
+        sm, lags, run_of = [], [], []
+        for r, run in enumerate(runs):
+            f = smooth_run(run, win_s, poly, None if max_step is None else MAX_SMOOTH_DEV)
             if len(run) >= 16:
                 lags.append(lag_samples([d["kp2"][0] for d in run], [d["kp2"][0] for d in f]))
             sm.extend(f)
+            run_of.extend([r] * len(f))
         frames = []
+        near = max(float(hold), 1e-6) if max_step is not None else -1.0
+        if len(sm) == 1 and max_step is not None:    # a lone sample is reported on its own frame
+            frames = [dict(t=float(ft), kp2=sm[0]["kp2"], kp3=sm[0]["kp3"], score=sm[0]["score"])
+                      for ft in frame_times if abs(ft - sm[0]["t"]) <= near]
         if len(sm) >= 2:
             ta = np.array([d["t"] for d in sm])
             A2 = np.stack([d["kp2"] for d in sm])
             A3 = np.stack([d["kp3"] for d in sm])
             for ft in frame_times:
                 i = int(np.clip(np.searchsorted(ta, ft), 1, len(ta) - 1))
-                if not (ta[i - 1] - 1e-6 <= ft <= ta[i] + 1e-6):
+                inside = ta[i - 1] - 1e-6 <= ft <= ta[i] + 1e-6
+                j = i if abs(ft - ta[i]) < abs(ft - ta[i - 1]) else i - 1      # the nearest sample
+                if abs(ft - ta[j]) <= 1e-6 and max_step is not None:           # its own frame
+                    frames.append(dict(t=float(ft), kp2=A2[j], kp3=A3[j], score=sm[j]["score"]))
                     continue
-                if ta[i] - ta[i - 1] > max_fill:
+                if (not inside or ta[i] - ta[i - 1] > max_fill
+                        or (max_step is not None and run_of[i] != run_of[i - 1])):
+                    if abs(ft - ta[j]) <= near:
+                        frames.append(dict(t=float(ft), kp2=A2[j], kp3=A3[j], score=sm[j]["score"]))
                     continue
                 w = float(np.clip((ft - ta[i - 1]) / max(ta[i] - ta[i - 1], 1e-9), 0, 1))
                 frames.append(dict(t=float(ft), kp2=A2[i - 1] * (1 - w) + A2[i] * w,
                                    kp3=A3[i - 1] * (1 - w) + A3[i] * w, score=sm[i]["score"]))
         out[side] = frames
         stats[side] = dict(raw=len(raw[side]), kept=len(kept), frames=len(frames), dropped=dropped,
-                           runs=len(split_runs(kept, max_gap)), spikes=nfix,
+                           runs=len(runs), spikes=nfix,
                            sample_step_px_before=pre2, sample_step_px_after=med_step(sm, "kp2"),
                            frame_step_px=med_step(frames, "kp2"),
                            lag_samples=float(np.mean(lags)) if lags else 0.0)

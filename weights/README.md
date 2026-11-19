@@ -16,6 +16,9 @@ weights/
       merges.txt
   mano/
     MANO_RIGHT.pt                          YOU create this (see below)
+  hand_detector/
+    detector.pt                            run_nwbench.py only; YOU download this (see the main README)
+    detector_nwbench.pt                    optional; YOU create this with train_detector.py (see the main README)
 ```
 
 SHA-256 of every file is in `../ASSETS.json`.
