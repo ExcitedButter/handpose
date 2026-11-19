@@ -167,10 +167,11 @@ def _shoe(shoe):
     return SHOE_PEN * min(1., max(0., shoe - SHOE_MARGIN) / SHOE_RANGE)
 
 
-def label_hands(times, boxes, scores, width, whites=None, shoes=None, extra=None):
+def label_hands(times, boxes, scores, width, whites=None, shoes=None, extra=None, sides=None):
     """Viterbi labeling. ``boxes[k]``/``scores[k]``/``whites[k]`` are the candidates of frame k;
     ``shoes[k]`` their shoe-minus-glove scores (see :func:`shoe_scores`); ``extra[k]`` further
-    costs of taking a candidate as a hand."""
+    costs of taking a candidate as a hand; ``sides[k]`` per candidate the costs of taking it as
+    the left and as the right hand."""
     n = len(times)
     states, emit = [], []
     for k in range(n):
@@ -178,6 +179,7 @@ def label_hands(times, boxes, scores, width, whites=None, shoes=None, extra=None
         wk = whites[k] if whites is not None else [1.] * len(b)
         sk = shoes[k] if shoes is not None else [0.] * len(b)
         xk = extra[k] if extra is not None else [0.] * len(b)
+        dk = sides[k] if sides is not None else [(0., 0.)] * len(b)
         st, em = [], []
         idx = range(-1, len(b))
         for i in idx:
@@ -189,10 +191,10 @@ def label_hands(times, boxes, scores, width, whites=None, shoes=None, extra=None
                 cost = 0.
                 if i >= 0:
                     x = center(b[i])[0] / width
-                    cost += -_bonus(s[i]) + _appearance(wk[i]) + _shoe(sk[i]) + xk[i] + SIDE * max(0., x - .65) / .35
+                    cost += -_bonus(s[i]) + _appearance(wk[i]) + _shoe(sk[i]) + xk[i] + dk[i][0] + SIDE * max(0., x - .65) / .35
                 if j >= 0:
                     x = center(b[j])[0] / width
-                    cost += -_bonus(s[j]) + _appearance(wk[j]) + _shoe(sk[j]) + xk[j] + SIDE * max(0., .35 - x) / .35
+                    cost += -_bonus(s[j]) + _appearance(wk[j]) + _shoe(sk[j]) + xk[j] + dk[j][1] + SIDE * max(0., .35 - x) / .35
                 if i >= 0 and j >= 0 and center(b[i])[0] > center(b[j])[0] + .02 * width:
                     cost += CROSS
                 st.append((i, j))

@@ -264,6 +264,12 @@ hypotheses and stabilizer of this package and replaces the rest:
   prefers the larger ones: a box less than half as large as the reference
   pays a cost that grows as the box gets smaller, so a coworker's hand in the
   background does not take the label from the wearer's hand in front of it.
+* **Two hands on one object**: the labeling of `labeling.py` refuses two boxes
+  that share more than 60 % of the smaller one, which for gloves means two
+  boxes on one hand. Bare hands that shred or knead something lie against
+  each other, and their boxes overlap more than that; the limit is 80 % here.
+  Two poses that do end up on one hand are removed after the pose step (see
+  hand verification).
 * **Left and right**: `labeling.py` assigns the labels by position. When both
   arms reach in from one side this is the wrong way round for the whole
   video, and the pose network, given the wrong handedness, returns unstable
@@ -275,14 +281,27 @@ hypotheses and stabilizer of this package and replaces the rest:
   videos the flipped flags changed the disagreement by a factor of 0.60 on
   the one video with both arms from one side and by 1.27 to 4.7 on the
   others. `summary.json` reports `handedness_trial` and `left_right_swapped`.
+  Position also fails for a part of a video: one hand alone in the picture
+  on the other hand's side, or a hand next to an object taken for one. How
+  far the detector's vote on a box can be trusted differs between videos:
+  with WiLoR's weights it agrees with the labels on nearly every box of the
+  fisheye samples and is at chance on the gloved hands of `B06`; a detector
+  adapted to the videos (see below) has learned what their left and right
+  hands look like. Where the votes separate the two labels of a video (the
+  share of "right" votes is at least 0.5 higher on the boxes labeled right
+  than on those labeled left), the labeling is repeated with every vote
+  against a label as a cost; elsewhere nothing changes
+  (`detector_side_votes_used` in `summary.json`).
 * **Per-hand perspective view** (`fisheye.py`): each labeled hand is
   re-rendered through a virtual pinhole camera aimed at it, so the pose
   network sees an undistorted, centered hand. Keypoints are mapped back
   through the Double Sphere model of `camera.json`.
 * **Pose hypotheses** are scored against skin color instead of glove white.
 * **Hand verification**: a box is kept only when the box, refit and rotated
-  pose hypotheses agree and at least 8 of the 21 keypoints lie inside the
-  picture. The hand must be within arm's reach: 1 m with a calibrated camera,
+  pose hypotheses agree. On a box the detector is sure of (score 0.45 or
+  more) they may differ more: a hand seen edge-on or half hidden is read in
+  more than one way by the pose network. The hand must be within arm's
+  reach: 1 m with a calibrated camera,
   1.5 m at the assumed focal length without one. Finally the detector must
   confirm the hand: poses that can be the same hand form a run (it may pause
   for one sample),
@@ -296,7 +315,11 @@ hypotheses and stabilizer of this package and replaces the rest:
   support is dropped.
 * **Tracking through detector misses**: a hand the detector loses is followed
   from the neighboring pose sample, forward and backward, for up to 1 s, as
-  long as the result still passes the verification.
+  long as the result still passes the verification; a sample reached from
+  both sides takes the pose that is fewer steps from its detection. A hand
+  is output while at least 8 of its 21 keypoints lie inside the picture. It
+  is followed further, down to 2 keypoints, so that a hand that dips out of
+  the picture and comes back does not have to be detected again.
 * **Stabilization** uses a 0.4 s smoothing window and repairs only isolated
   outliers, so the start of a fast motion is not flattened; poses are sampled
   at 15 Hz (`--pose-hz`). A run ends where the label jumps to another hand
@@ -368,55 +391,105 @@ second view and how far the mono depth is from the triangulated one.
 every overlay into one video.
 
 Left/right is decided from image position and motion continuity, as in the
-EgoForce pipeline, followed by the whole-video check described above. That
-check is made once per video: labels that are wrong for only a part of a
-video are not corrected.
+EgoForce pipeline, followed by the whole-video check described above. Labels
+that are wrong for only a part of a video are corrected where the detector's
+votes can be trusted; with WiLoR's weights that leaves out the videos with
+gloved hands, after adaptation it covers them.
 
 `python eval/score.py results` reports recall and precision on frames
 labeled by eye. For eight of the nine videos without calibration,
-`eval/hand_points.json` holds the position of every hand on 59 to 95 evenly
-spaced frames: the wearer's clearly visible hands, which must be found; the
-wearer's hands that are cut by the image border, hidden or blurred, which
-count neither way; and, for six of the videos, other people's hands, where a
-skeleton is an error, and the side (left or right) of each of the wearer's
-hands. For the fisheye samples and `H02`, `eval/visible_hands.json` holds the
-number of visible hands on 41 to 47 frames each; this does not check where a
-skeleton lies. Frames without a visible hand do not count against recall.
+`eval/hand_points.json` holds the position and the side (left or right) of
+every hand on 59 to 95 evenly spaced frames: the wearer's clearly visible
+hands, which must be found; the wearer's hands that are cut by the image
+border, hidden or blurred ("partly visible"), which count neither way; and
+other people's hands, where a skeleton is an error. For the fisheye samples
+and `H02`, `eval/visible_hands.json` holds the number of visible hands on 41
+to 47 frames each; this does not check where a skeleton lies. Frames without
+a visible hand do not count against recall.
 
 The run stored in `results/` (detector adapted in two rounds) scores as
 follows; the second column is the same pipeline with WiLoR's detector as
-shipped.
+shipped (`pass0` above).
 
-| Sample | Recall, WiLoR's detector | Recall, adapted (found / labeled) | Precision, adapted (false skeletons) | Left/right correct |
-|---|---|---|---|---|
-| `mono_video_only/B02` | 92.4 % | 94.1 % (112 / 119) | 94.9 % (6) | not labeled |
-| `mono_video_only/B06` | 83.7 % | 96.9 % (95 / 98) | 97.9 % (2) | 93 / 95 |
-| `mono_video_only/B21` | 92.0 % | 95.6 % (108 / 113) | 100 % (0) | 107 / 108 |
-| `mono_video_only/B47` | 100 % | 100 % (82 / 82) | 98.8 % (1) | 82 / 82 |
-| `mono_video_only/H07` | 100 % | 99.2 % (117 / 118) | 100 % (0) | 117 / 117 |
-| `mono_video_only/H18` | 100 % | 100 % (106 / 106) | 100 % (0) | 106 / 106 |
-| `mono_video_only/L04` | 100 % | 100 % (43 / 43) | 97.7 % (1) | not labeled |
-| `mono_video_only/L07` | 97.8 % | 100 % (46 / 46) | 95.8 % (2) | 43 / 46 |
-| all eight | 95.2 % (690 / 725), precision 98.3 % (12) | 97.8 % (709 / 725) | 98.3 % (12) | 548 / 554 |
-| `H02`, `mono/case0`, `case10`, `case30`, `stereo/case0`, `case40` (counts) | 100 % | 100 % | 100 % | not labeled |
+<!-- RESULTS:BEGIN -->
+| Sample | Recall, WiLoR's detector | Recall, adapted (found / labeled) | Precision, adapted (false skeletons) | Left/right correct | Partly visible hands with a skeleton |
+|---|---|---|---|---|---|
+| `mono_video_only/B02` | 93.3 % | 96.6 % (115 / 119) | 97.5 % (3) | 115 / 115 | 39 / 59 |
+| `mono_video_only/B06` | 83.7 % | 96.9 % (95 / 98) | 97.9 % (2) | 95 / 95 | 14 / 17 |
+| `mono_video_only/B21` | 91.2 % | 99.1 % (112 / 113) | 100 % (0) | 112 / 112 | 7 / 7 |
+| `mono_video_only/B47` | 100 % | 100 % (82 / 82) | 97.6 % (2) | 82 / 82 | 16 / 18 |
+| `mono_video_only/H07` | 100 % | 100 % (118 / 118) | 100 % (0) | 118 / 118 | 2 / 2 |
+| `mono_video_only/H18` | 100 % | 100 % (106 / 106) | 100 % (0) | 106 / 106 | 9 / 10 |
+| `mono_video_only/L04` | 100 % | 100 % (43 / 43) | 97.7 % (1) | 42 / 42 | 19 / 31 |
+| `mono_video_only/L07` | 97.8 % | 100 % (46 / 46) | 97.9 % (1) | 45 / 46 | 19 / 26 |
+| all eight | 95.2 % (690 / 725); precision 98.3 % (12), left/right 676 / 689, partly visible 100 / 170 | 98.9 % (717 / 725) | 98.8 % (9) | 715 / 716 | 125 / 170 |
+| `H02`, `mono/case0`, `stereo/case0`, `mono/case10`, `mono/case30`, `stereo/case40` (counts) | 100 % | 100 % (488 / 488) | 100 % (0) | not labeled | |
 
-The fisheye samples do not change with the adapted detector (coverage within
-0.4 %, second-view reprojection 2.6 to 6.2 px against 2.4 to 6.1 px).
+On the 10 fisheye samples the adapted detector changes the coverage of a hand by at most 1.9 %.
+The stereo samples, fused from both cameras:
+
+| Sample | Reprojection error in the second view, left / right | Mono depth against triangulated depth, left / right |
+|---|---|---|
+| `stereo/case0` | 2.6 / 3.3 px | 1.4 / 3.4 % |
+| `stereo/case22` | 3.2 / 2.9 px | 4.0 / 3.9 % |
+| `stereo/case40` | 2.7 / 6.2 px | 2.7 / 7.7 % |
+| `stereo/case55` | 4.3 / 5.5 px | 2.2 / 2.5 % |
+<!-- RESULTS:END -->
+
+Coverage, the share of all frames of a video with a skeleton, also counts the
+frames in which the hand is not in the picture, and in several of these videos
+that is most of the time. The labels say how often a hand is in view; it
+cannot be covered more often than that. `score.py` prints both:
+
+<!-- COVERAGE:BEGIN -->
+| Sample | Frames with a skeleton, left / right | Hand in view at least partly, left / right | Hand clearly visible, left / right |
+|---|---|---|---|
+| `mono/case0` | 67.4 % / 68.3 % | both hands together: 69.6 % (counts) | |
+| `mono/case5` | 100.0 % / 100.0 % | not labeled | |
+| `mono/case10` | 100.0 % / 100.0 % | both hands together: 100.0 % (counts) | |
+| `mono/case22` | 100.0 % / 100.0 % | not labeled | |
+| `mono/case30` | 100.0 % / 100.0 % | both hands together: 100.0 % (counts) | |
+| `mono/case47` | 100.0 % / 100.0 % | not labeled | |
+| `stereo/case0` | 76.1 % / 72.7 % | both hands together: 74.4 % (counts) | |
+| `stereo/case22` | 100.0 % / 100.0 % | not labeled | |
+| `stereo/case40` | 99.6 % / 100.0 % | both hands together: 100.0 % (counts) | |
+| `stereo/case55` | 100.0 % / 100.0 % | not labeled | |
+| `mono_video_only/B02` | 69.4 % / 92.9 % | 83.0 % / 97.9 % | 40.4 % / 86.2 % |
+| `mono_video_only/B06` | 93.7 % / 92.9 % | 95.0 % / 96.7 % | 86.7 % / 76.7 % |
+| `mono_video_only/B21` | 99.2 % / 97.8 % | 100.0 % / 100.0 % | 96.7 % / 91.7 % |
+| `mono_video_only/B47` | 84.8 % / 83.2 % | 83.3 % / 83.3 % | 76.7 % / 60.0 % |
+| `mono_video_only/H02` | 100.0 % / 100.0 % | both hands together: 100.0 % (counts) | |
+| `mono_video_only/H07` | 100.0 % / 100.0 % | 100.0 % / 100.0 % | 98.3 % / 98.3 % |
+| `mono_video_only/H18` | 99.4 % / 93.0 % | 100.0 % / 93.3 % | 96.7 % / 80.0 % |
+| `mono_video_only/L04` | 35.3 % / 34.7 % | 35.8 % / 40.0 % | 22.1 % / 22.1 % |
+| `mono_video_only/L07` | 30.7 % / 79.1 % | 33.9 % / 86.4 % | 20.3 % / 57.6 % |
+<!-- COVERAGE:END -->
+
+Where coverage exceeds the share in view, the difference is sampling (the
+labels cover every 8th to 15th frame) and the few false skeletons.
 
 How far these numbers carry:
 
 * The adapted detector was trained on these same videos, on the pipeline's
-  own output. Leave-one-out, with the detector trained on the other 18
-  samples only, `B02`, `B06` and `B21` together reach 295 of 330 hands with 12
-  false skeletons, against 296 and 8 with WiLoR's detector: no gain. New
-  videos need their own adaptation rounds.
-* After one round the total is the same as after two (710 of 725 hands, 12
-  false), but distributed differently: `B06` 88.8 %, `B02` 96.6 %, `B21`
-  100 %. A few hands per video move with the training set.
-* The remaining misses are hands inside a plastic bag or pressed against the
-  other hand (`B02`, `B21`); the false skeletons lie on a man walking past
-  whose hand is as near and as large as the wearer's (`B06`), on hands mostly
-  outside the picture (`B02`, `B47`) and on the bar top (`L07`).
+  own output. Leave-one-out, measured with the previous version of the
+  pipeline and the detector trained on the other 18 samples only, `B02`,
+  `B06` and `B21` together reached 295 of 330 hands with 12 false skeletons,
+  against 296 and 8 with WiLoR's detector: no gain. New videos need their own
+  adaptation rounds.
+* <!-- ONE_ROUND -->After one round the eight videos reach 714 of 725 hands with 9 false skeletons, after two 717 with 9. A third round, and
+  stronger shift augmentation in the training, changed single videos by a
+  few hands but not the total. A few hands per video move with the training
+  set.
+* After adaptation the left/right votes come from a detector that learned
+  the names from the pipeline's own labels. They correct stretches that
+  deviate from the rest of a video; a video labeled the wrong way round as a
+  whole stays that way unless the handedness trial catches it.
+* The remaining misses are hands inside a plastic bag, very close to the
+  camera or pressed against the other hand (`B02`, `B06`, `B21`); the false
+  skeletons lie on plastic bags and on hands that are almost outside the
+  picture (`B02`, `B47`) and on a glass on the bar top (`L07`). Raising the
+  number of keypoints that must lie inside the picture removes some of the
+  latter and as many partly visible hands with them.
 
 ## Lower-level tools
 

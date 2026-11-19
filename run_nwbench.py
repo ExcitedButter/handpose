@@ -13,22 +13,28 @@ This is the EgoForce pipeline adapted to NW_bench. What changes, and why:
     of that video (bystanders' hands, hand-like background); among the rest
     the labeling prefers the larger boxes, which are the wearer's hands.
   * Left/right labels: the offline Viterbi labeling of labeling.py, without
-    its white-glove and shoe terms. It tells left from right by position;
+    its white-glove and shoe terms, and with more overlap allowed between
+    the two boxes (hands pressed together). It tells left from right by position;
     when both the detector's own left/right votes and the stability of the
     pose network say the opposite for the whole video (both arms reaching in
-    from one side), the labels are swapped.
+    from one side), the labels are swapped. Where the detector's votes agree
+    with the labels over the video (always after adaptation to the videos),
+    they also enter the labeling box by box, which corrects stretches that
+    the position alone names wrongly.
   * Pose. Each labeled hand is re-rendered through a virtual pinhole camera
     aimed at it (fisheye.py), so the pose network sees an undistorted,
     centered hand. The four pose hypotheses of pose_select.py are computed
     in that view, scored against skin color instead of glove white, and mapped
     back through the Double Sphere model of camera.json.
-  * Verification. A box counts as a hand when its pose hypotheses agree, at
-    least 8 of its 21 keypoints lie inside the picture and the hand is
+  * Verification. A box counts as a hand when its pose hypotheses agree
+    (they may differ more on a box the detector is sure of) and the hand is
     within arm's reach (1 m; 1.5 m at the assumed focal length of a video
     without calibration). The detector must confirm every run of poses at
     least once per second, in the full frame or in the hand's own view. A
     hand the detector loses is followed from the neighboring pose sample
-    for up to 1 s. A left and a right pose that coincide are one hand.
+    for up to 1 s, forward and backward, also while it is partly outside
+    the picture; it is output where at least 8 of its 21 keypoints lie
+    inside. A left and a right pose that coincide are one hand.
   * Stabilization: stabilize.py with ``max_step``: a run ends where the label
     jumps to another hand, smoothing may not move a sample away from its
     measured pose, and only a single missing sample is interpolated. A frame
@@ -91,10 +97,14 @@ FACE_BOTTOM = 0.03       # fisheye: a box ending within this share of the height
 FACE_CENTER = 0.90       # or centered below this share of the height, is the wearer's own face
 # Hand verification and tracking through detector misses
 AGREE_MAX = 0.35         # largest hypothesis disagreement (see agreement()) accepted on a detected box
+AGREE_STRONG = 0.55      # ... on a box the detector scores CONFIRM_MIN or more (a hand seen edge-on or half hidden, which
+                         # the pose network reads in more than one way although the detector is sure of it)
 AGREE_TRACK = 0.20       # ... on a box propagated from the neighboring pose sample
 MAX_REACH_M = 1.0        # a hand farther than this is somebody else's. Without calibration depth is proportional to
 FOCAL_TOLERANCE = 1.5    # the assumed focal length, which may be off by this factor; the limit is widened by it
-MIN_KP_INSIDE = 8        # keypoints (of 21) that must lie inside the image; fewer: the hand has left the view
+MIN_KP_INSIDE = 8        # keypoints (of 21) that must lie inside the image for a hand to be output; with fewer the
+TRACK_KP_INSIDE = 2      # hand has left the view, but it is still followed down to this many, so that it need not
+                         # be found again when it comes back
 MIRROR_MAX_SHIFT = 0.3   # hand sizes; the mirror-image hypothesis must lie on the hand the other three found,
 MIRROR_MAX_RESIZE = 1.4  # with about their extent
 CONFIRM_MIN = 0.45       # a run of pose samples is a hand only where the detector, in the full frame or in the hand's
@@ -116,6 +126,10 @@ SAME_HAND = 0.15         # hand sizes; a left and a right pose whose joints lie 
 MAX_CANDIDATES = 5
 BIRTH_DEATH = 0.4        # cost of a hand appearing or disappearing. The EgoForce value of 0.8 drops a detection that
                          # stands alone between two misses; here such a box is kept and judged by its pose instead.
+SIDE_TRUST = 0.5         # the detector's left/right votes are used when the share of "right" votes on the boxes
+SIDE_VOTE = 2.0          # labeled right exceeds that on the boxes labeled left by this; cost = SIDE_VOTE * votes against
+OVERLAP_MAX = 0.8        # two labeled boxes may share this much of the smaller one (EgoForce: 0.6). Bare hands that
+                         # work on one object press against each other; two poses on one hand are removed later
 SWAP_SAMPLES = 40        # left/right check (see handedness_trial): pose samples tried with both handedness flags;
 SWAP_GAIN = 0.8          # labels are swapped when the flipped flags lower the hypothesis disagreement below this share
                          # (19 NW_bench videos: 0.60 on the one with both arms from one side, 1.27 to 4.7 on the others)
@@ -348,8 +362,9 @@ def track_view(mp4, cam, is_fisheye, models, args, swap=None):
     # crowd the bystanders' hands, just removed, outscore the wearer's own and would use up the list.
     for seq in (cb, cs, cr) + ((share,) if share else ()):
         seq[:] = [v[:MAX_CANDIDATES] for v in seq]
-    lab = labeling.label_hands(np.asarray(times), cb, [[label_score(v) for v in c] for c in cs], width=cam.width,
-                               extra=share and [[SIZE_PEN * max(0.0, 1 - v / SIZE_NEAR) for v in vs] for vs in share])
+    extra = share and [[SIZE_PEN * max(0.0, 1 - v / SIZE_NEAR) for v in vs] for vs in share]
+    scores = [[label_score(v) for v in c] for c in cs]
+    lab = labeling.label_hands(np.asarray(times), cb, scores, width=cam.width, extra=extra)
 
     # labeling.py tells left from right by position (the left hand is normally on the left). When both arms
     # reach in from one side this is the wrong way round for the whole video, and the pose network, given
@@ -358,6 +373,15 @@ def track_view(mp4, cam, is_fisheye, models, args, swap=None):
     # labels over the whole video, and the pose network must agree with itself clearly better with the
     # handedness flags flipped.
     vote = detector_right_share(lab, cb, cr)
+    # The detector also calls every box left or right. How well depends on the video: WiLoR's detector is right
+    # on nearly every box of the fisheye views and at chance on gloved hands, and one adapted to the videos
+    # (train_detector.py) has learned what their left and right hands look like. Where the votes separate the
+    # two labels of the video, they enter a second labeling as a cost, which corrects the stretches in which
+    # the position alone gave the wrong name (one hand in view, or a hand and an object taken for one).
+    side_votes = vote[1] - vote[0] >= SIDE_TRUST
+    if side_votes:
+        lab = labeling.label_hands(np.asarray(times), cb, scores, width=cam.width, extra=extra,
+                                   sides=[[(SIDE_VOTE * r, SIDE_VOTE * (1 - r)) for r in rs] for rs in cr])
     trial, swapped = None, bool(swap)
     if swap is None and vote[0] > vote[1]:
         trial = handedness_trial(mp4, cam, lab, keys, n, extractor)
@@ -366,7 +390,7 @@ def track_view(mp4, cam, is_fisheye, models, args, swap=None):
         lab.left, lab.right, lab.left_score, lab.right_score = lab.right, lab.left, lab.right_score, lab.left_score
     reach = MAX_REACH_M if is_fisheye else MAX_REACH_M * FOCAL_TOLERANCE
     wanted = {key: k for k, key in enumerate(keys)}
-    track, refused = {0: {}, 1: {}}, {0: {}, 1: {}}
+    track, back, refused = {0: {}, 1: {}}, {0: {}, 1: {}}, {0: {}, 1: {}}
     max_age = max(1, int(round(TRACK_MAX_S * (args.pose_hz if args.pose_hz > 0 else 30))))
     rejected, lost = {}, {}
 
@@ -383,7 +407,7 @@ def track_view(mp4, cam, is_fisheye, models, args, swap=None):
         if not np.isfinite(xy).all():
             return None, "outside the camera model"
         p = xy[1]
-        if in_image(p, cam) < MIN_KP_INSIDE:
+        if in_image(p, cam) < TRACK_KP_INSIDE:
             return None, "outside the image"
         t, _ = fisheye.solve_translation(view.to_camera(kp3[0][1]), cam.unproject(p))
         a = agreement(xy)
@@ -441,7 +465,7 @@ def track_view(mp4, cam, is_fisheye, models, args, swap=None):
             e = None
             if box is not None:
                 e, why = pose_at(img, side, box, DET_CONF + (sc - label_score(DET_CONF)) / 0.5, 0)
-                why = why or refusal(e, AGREE_MAX)
+                why = why or refusal(e, AGREE_STRONG if e["det"] >= CONFIRM_MIN else AGREE_MAX)
                 if why is not None:
                     count(rejected, why)
                     if e is not None:
@@ -456,19 +480,24 @@ def track_view(mp4, cam, is_fisheye, models, args, swap=None):
             if e is None:
                 continue
             track[side][k] = e
-            if e["age"] == 0:                                            # backward from a fresh detection
-                cur, need = e, k - 1
+            if e["age"] == 0:                                            # backward from a fresh detection,
+                cur, need = e, k - 1                                     # up to the previous one
                 for j, old in reversed(recent):
-                    if j != need or j in track[side] or cur["age"] >= max_age:
+                    if j != need or cur["age"] >= max_age or track[side].get(j, {"age": 1})["age"] == 0:
                         break
                     b, why = propagate(old, side, j, cur)
                     if b is None:
                         count(lost, why)
                         break
-                    track[side][j] = cur = b
+                    back[side][j] = cur = b
                     tracked += 1
                     need -= 1
         recent.append((k, img))
+    # Where a sample was reached from both sides, the pose that is fewer steps from its detection is kept.
+    for side in track:
+        for k, e in back[side].items():
+            if k not in track[side] or e["age"] < track[side][k]["age"]:
+                track[side][k] = e
     return {"frame_t": ft, "keys": keys, "times": times, "cand_boxes": cb, "cand_scores": cs, "cand_right": cr,
             "left": lab.left, "right": lab.right, "track": track, "refused": refused,
             "stats": {"pose_samples": len(keys), "labeling": lab.stats, "candidates_dropped_too_small": int(distant),
@@ -476,7 +505,8 @@ def track_view(mp4, cam, is_fisheye, models, args, swap=None):
                       "handedness_trial": None if trial is None else {"disagreement_as_labeled": round(trial[0], 3),
                                                                       "disagreement_flipped": round(trial[1], 3),
                                                                       "boxes": trial[2]},
-                      "left_right_swapped": bool(swapped), "boxes_rejected": rejected,
+                      "left_right_swapped": bool(swapped), "detector_side_votes_used": bool(side_votes),
+                      "boxes_rejected": rejected,
                       "samples_tracked_through_detector_miss": int(tracked), "tracking_stopped": lost}}
 
 
@@ -746,6 +776,7 @@ def configure():
     pose_select.glove_mask = skin_mask
     stabilize.hampel = isolated_spikes
     labeling.BIRTH = labeling.DEATH = BIRTH_DEATH
+    labeling.OVERLAP_MAX = OVERLAP_MAX
 
 
 def main():
