@@ -8,3 +8,8 @@ protobuf>=5
 zstandard>=0.23
 lz4>=4.3
 scipy>=1.10
+# run_nwbench.py only (WiLoR YOLO hand detector):
+ultralytics>=8.3
+dill>=0.3
+# train_detector.py only:
+polars>=1.0

@@ -9,3 +9,6 @@ weights/**/*.yaml
 weights/**/*.json
 weights/**/*.txt
 !weights/README.md
+# NW_bench videos and run_nwbench.py output
+data/
+results/
