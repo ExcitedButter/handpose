@@ -9,7 +9,8 @@ outputs are skipped. The pipeline is:
 
   YOLO-World glove/hand detection on every pose frame (plus a shoe-vs-glove score per box)
   -> offline left/right labeling of the whole recording (labeling.py)
-  -> AnyHand-WiLoR (MANO) pose at ``--pose-hz``
+  -> AnyHand-WiLoR (MANO) pose at ``--pose-hz``, plus verified poses inside short
+     gaps of a hand's track (labeling.rescue_gaps)
   -> zero-phase stabilization (stabilize.py)
   -> one npz with a row per video frame.
 
@@ -36,6 +37,15 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+
+# A pose rescued inside a gap (labeling.rescue_gaps) is kept only if one hypothesis lies on
+# the glove (skeleton points on white pixels, rendered mesh covering part of the glove), the
+# pose is not larger than its box and the wrist lies in the box (20 % margin).
+RESCUE_GLOVE = 0.6
+RESCUE_GLOVE_INTERP = 0.85  # stricter when no detector box was found at all (interpolated box)
+RESCUE_COVER = 0.15
+RESCUE_MAX_EXT = 1.0
+RESCUE_SCORE = 0.1      # detector score given to a rescued hand (stabilize.MIN_SCORE is 0.05)
 
 
 def parse_args(argv=None):
@@ -80,6 +90,16 @@ def load_hand_detector(device):
     model.to(device)
     print(f"Hand detector: {path}", flush=True)
     return model
+
+
+def rescue_shape_ok(kp, box):
+    """A rescued pose must fit its box: extent at most RESCUE_MAX_EXT x the box side, wrist inside (20 % margin)."""
+    kp, box = np.asarray(kp, np.float64), np.asarray(box, np.float64)
+    side = max(box[2] - box[0], box[3] - box[1], 1.)
+    m = 0.2 * side
+    w = kp[0]
+    return bool(np.ptp(kp, axis=0).max() <= RESCUE_MAX_EXT * side and box[0] - m <= w[0] <= box[2] + m
+                and box[1] - m <= w[1] <= box[3] + m)
 
 
 def arm_check(preds, frame_wh):
@@ -179,6 +199,7 @@ class Pipeline:
         # the detector letterboxes to 640 px either way).
         sampler = FrameSampler(start_s=0.0, sample_hz=args.pose_hz) if args.pose_hz > 0 else None
         keys, times, cand_boxes, cand_scores, cand_whites, cand_shoes = [], [], [], [], [], []
+        cand_spare = []
         seen_times, frame_wh, stereo_wh, last_t = [], None, None, None
         for key, frame in frames(1.0):
             seen_times.append(frame.offset_s)
@@ -191,15 +212,19 @@ class Pipeline:
             last_t = frame.offset_s
             if sampler is not None and not sampler.select(frame.offset_s):
                 continue
-            boxes, scores, whites, shoes = labeling.detect_candidates(self.detector, frame.image, scale=det_scale,
-                                                                      shoe_detector=self.shoe_detector,
-                                                                      hand_detector=self.hand_detector)
+            boxes, scores, whites, shoes, spare = labeling.detect_candidates(
+                self.detector, frame.image, scale=det_scale, shoe_detector=self.shoe_detector,
+                hand_detector=self.hand_detector)
             keys.append(key); times.append(frame.offset_s)
             cand_boxes.append(boxes); cand_scores.append(scores); cand_whites.append(whites); cand_shoes.append(shoes)
+            cand_spare.append(spare)
         if not seen_times:
             raise ValueError(f"No frames decoded from {src}")
         lab = labeling.label_hands(np.asarray(times), cand_boxes, cand_scores, width=frame_wh[0], whites=cand_whites,
                                    shoes=cand_shoes)
+        rescue = labeling.rescue_gaps(lab, np.asarray(times), cand_boxes, cand_whites, cand_spare)
+        accept_all = os.environ.get("HANDPOSE_RESCUE_ACCEPT_ALL") == "1"   # calibration only
+        rescue_stats = {"tried": 0, "kept": 0, "kept_candidate": 0}
 
         # Pass 2: pose hypotheses for the labeled boxes (pose_select.py).
         wanted = {key: k for k, key in enumerate(keys)}
@@ -209,14 +234,27 @@ class Pipeline:
             k = wanted.get(key)
             if k is None:
                 continue
-            boxes, right, score = [], [], []
+            boxes, right, score, origin = [], [], [], []
             for side, box, sc in ((0, lab.left[k], lab.left_score[k]), (1, lab.right[k], lab.right_score[k])):
                 if box is not None:
-                    boxes.append(box); right.append(side); score.append(sc)
+                    boxes.append(box); right.append(side); score.append(sc); origin.append(None)
+            for side, box, how in rescue.get(k, []):
+                boxes.append(box); right.append(side); score.append(RESCUE_SCORE); origin.append(how)
             kp2, kp3, glove, base = pose_select.hypotheses(self.extractor, frame.image, boxes, right,
                                                            batch_size=2 if self.device == "cuda" else 1)
             for i, (hand, sc) in enumerate(zip(base, score)):
                 hand["detector_score"] = sc
+                hand["evidence"] = glove[i].max(0).tolist()
+                if origin[i] is not None:
+                    rescue_stats["tried"] += 1
+                    g_min = RESCUE_GLOVE if origin[i] == "candidate" else RESCUE_GLOVE_INTERP
+                    ok = bool(((glove[i, :, 0] >= g_min) & (glove[i, :, 1] >= RESCUE_COVER)).any()) and \
+                        rescue_shape_ok(hand["keypoints_2d"], boxes[i])
+                    hand["rescued"] = origin[i] if ok else "rejected:" + origin[i]
+                    if not (ok or accept_all):
+                        continue
+                    rescue_stats["kept"] += int(ok)
+                    rescue_stats["kept_candidate"] += int(ok and origin[i] == "candidate")
                 track[right[i]][k] = (kp2[i], kp3[i], glove[i], hand)
             rows[k] = frame.offset_s
         # Offline choice of one hypothesis per sample, per hand and per run of consecutive samples.
@@ -254,7 +292,8 @@ class Pipeline:
         if save_predictions is not None:
             def plain(v):
                 return v.tolist() if isinstance(v, np.ndarray) else (v.item() if isinstance(v, np.generic) else v)
-            keep = ("right", "track_id", "detector_score", "keypoints_2d", "joints_3d", "cam_t", "bbox", "hypothesis")
+            keep = ("right", "track_id", "detector_score", "keypoints_2d", "joints_3d", "cam_t", "bbox", "hypothesis",
+                    "evidence", "rescued")
             with gzip.open(save_predictions, "wt") as f:
                 for _, row in preds:
                     hands = [{k: plain(v) for k, v in h.items() if k in keep} for h in row["hands"]]
@@ -263,7 +302,7 @@ class Pipeline:
         return {"input": str(src), "frames": len(frame_times), "poses": len(preds),
                 "elapsed_s": round(time.perf_counter() - started, 1),
                 "coverage_L": round(float(arrs["L_ok"].mean()), 4), "coverage_R": round(float(arrs["R_ok"].mean()), 4),
-                "labeling": lab.stats,
+                "labeling": lab.stats, "gap_rescue": rescue_stats,
                 "pose_hypotheses_chosen": dict(zip(("box", "refit", "rotated", "mirror_alt"), map(int, hyp_counts))),
                 "arm_check": arm_check(preds, frame_wh), "stabilizer": stats, "output": str(output)}
 

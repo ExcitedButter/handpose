@@ -57,6 +57,11 @@ SHOE_MATCH = 0.5        # IoU for a shoe-query box to describe a candidate
 SHOE_MARGIN = 0.15      # shoe score minus glove score where the penalty starts
 SHOE_RANGE = 0.25       # ... and over which it ramps up to SHOE_PEN
 SHOE_PEN = 3.0          # penalty for a box that is clearly a shoe (v10: 6 -> 3, so a glove holding a shoe is kept)
+HD_EVID_CONF = 0.05     # hand-detector boxes at least this confident are kept as gap candidates
+# Gap rescue (v11): inside a short gap of one hand's track, a weak box near the interpolated position
+RESCUE_MAX_S = 2.0      # longest gap (seconds) that is searched
+RESCUE_IOU = 0.3        # IoU with the interpolated box for a weak candidate to be used
+RESCUE_WHITE = 0.2      # minimum white share of a weak candidate
 
 
 def area(b):
@@ -123,28 +128,34 @@ def shoe_scores(shoe_detector, image, boxes):
 
 
 def hand_detector_boxes(hand_detector, image, rows):
-    """Boxes of the optional hand detector (WiLoR's YOLO hand detector) that no
-    candidate in ``rows`` covers (IoU <= 0.5), as rows [x0, y0, x1, y1, score]."""
+    """Boxes of the optional hand detector (WiLoR's YOLO hand detector).
+
+    Returns ``(extra, dets)``: ``extra`` are up to HAND_DET_MAX boxes with confidence
+    >= HAND_DET_CONF that no candidate in ``rows`` covers (IoU <= 0.5), as rows
+    [x0, y0, x1, y1, HAND_DET_SCALE x confidence]; ``dets`` are all detections with
+    confidence >= HD_EVID_CONF as rows [x0, y0, x1, y1, confidence]."""
     if hand_detector is None:
-        return []
-    r = hand_detector.predict(image, conf=HAND_DET_CONF, verbose=False)[0]
+        return [], []
+    r = hand_detector.predict(image, conf=HD_EVID_CONF, verbose=False)[0]
     if not len(r.boxes):
-        return []
+        return [], []
+    dets = sorted(([float(v) for v in b] + [float(c)] for b, c in
+                   zip(r.boxes.xyxy.cpu().numpy().tolist(), r.boxes.conf.cpu().numpy().tolist())), key=lambda d: -d[4])
     out = []
-    det = sorted(zip(r.boxes.xyxy.cpu().numpy().tolist(), r.boxes.conf.cpu().numpy().tolist()), key=lambda d: -d[1])
-    for b, c in det:
-        if any(iou(b, o) > .5 for o in rows + out):
+    for d in dets:
+        if d[4] < HAND_DET_CONF or any(iou(d, o) > .5 for o in rows + out):
             continue
-        out.append([float(v) for v in b] + [HAND_DET_SCALE * float(c)])
+        out.append(d[:4] + [HAND_DET_SCALE * d[4]])
         if len(out) >= HAND_DET_MAX:
             break
-    return out
+    return out, dets
+
 
 
 def detect_candidates(detector, image, scale=1.0, shoe_detector=None, hand_detector=None):
     """Candidate hand boxes on one frame, in coordinates multiplied by ``scale``.
 
-    Returns ``(boxes, scores, whites, shoes)``; ``whites`` is the white-pixel
+    Returns ``(boxes, scores, whites, shoes, spare)``; ``whites`` is the white-pixel
     share of each box (see :func:`whiteness`), ``shoes`` its shoe-minus-glove
     score (see :func:`shoe_scores`; zeros without ``shoe_detector``).
 
@@ -155,6 +166,8 @@ def detect_candidates(detector, image, scale=1.0, shoe_detector=None, hand_detec
         With ``hand_detector`` (an ultralytics YOLO hand detector), up to
     ``HAND_DET_MAX`` of its boxes that no candidate covers are appended with
     score ``HAND_DET_SCALE`` x confidence (see :func:`hand_detector_boxes`).
+    ``spare`` holds the remaining weak hand-detector boxes as arrays
+    [x0, y0, x1, y1, confidence, white share], used only to fill gaps (:func:`rescue_gaps`).
     """
     h, w = image.shape[:2]
     rows = [list(map(float, r[:5])) for r in detector.predict(image, conf=CONF, iou=.5)]
@@ -170,12 +183,14 @@ def detect_candidates(detector, image, scale=1.0, shoe_detector=None, hand_detec
         if len(inside) >= 2 and overlap_small(inside[0], inside[1]) < .5:
             merged.append(r)
     rows = [r for r in rows if r not in merged][:MAX_CANDIDATES]
-    extra = hand_detector_boxes(hand_detector, image, rows)
+    extra, dets = hand_detector_boxes(hand_detector, image, rows)
     whites = [whiteness(image, r[:4]) for r in rows + extra]
     # Hand-detector boxes get no shoe score: they mostly recover a glove holding a shoe.
     shoes = list(shoe_scores(shoe_detector, image, [r[:4] for r in rows])) + [0.] * len(extra)
     rows = rows + extra
-    return [np.array(r[:4], np.float32) * scale for r in rows], [r[4] for r in rows], whites, shoes
+    spare = [np.array([v * scale for v in d[:4]] + [d[4], whiteness(image, d[:4])], np.float32)
+             for d in dets if all(iou(d, r) <= .5 for r in rows)]
+    return [np.array(r[:4], np.float32) * scale for r in rows], [r[4] for r in rows], whites, shoes, spare
 
 
 def _bonus(score):
@@ -311,3 +326,52 @@ def _smooth_sizes(seq, radius=2):
             c = center(seq[t])
             seq[t] = np.array([c[0] - m[0] / 2, c[1] - m[1] / 2, c[0] + m[0] / 2, c[1] + m[1] / 2], np.float32)
         k = e
+
+
+def rescue_gaps(lab, times, boxes, whites, spare=None):
+    """Boxes for samples inside short gaps of a labeled hand track (v11).
+
+    A gap of at most RESCUE_MAX_S seconds with the hand labeled on both sides is
+    usually a partial occlusion: the hand is still there, the detector just gave
+    it no usable box. For each sample of such a gap, the box interpolated
+    between the two ends is compared with that frame's candidates and weak
+    hand-detector boxes (``spare``); the best one with IoU >= RESCUE_IOU and
+    white share >= RESCUE_WHITE is used, otherwise the interpolated box itself.
+    The caller verifies every rescued pose against the image before keeping it.
+
+    Returns ``{k: [(side, box, source), ...]}`` with source "candidate" or "interpolated".
+    """
+    out = {}
+    n = len(times)
+    for side, seq, other in ((0, lab.left, lab.right), (1, lab.right, lab.left)):
+        k = 0
+        while k < n:
+            if seq[k] is not None:
+                k += 1
+                continue
+            e = k
+            while e < n and seq[e] is None:
+                e += 1
+            if k == 0 or e == n or times[e] - times[k - 1] > RESCUE_MAX_S:
+                k = e
+                continue
+            a, b = np.asarray(seq[k - 1], np.float32), np.asarray(seq[e], np.float32)
+            t0, t1 = times[k - 1], times[e]
+            for t in range(k, e):
+                w = (times[t] - t0) / max(t1 - t0, 1e-6)
+                ib = (1 - w) * a + w * b
+                cands = [(np.asarray(c, np.float32), wh) for c, wh in zip(boxes[t], whites[t])]
+                if spare is not None:
+                    cands += [(np.asarray(r[:4], np.float32), float(r[5])) for r in spare[t]]
+                best, src, bv = ib, "interpolated", RESCUE_IOU
+                for c, wh in cands:
+                    if other[t] is not None and overlap_small(c, other[t]) > OVERLAP_MAX:
+                        continue
+                    v = iou(c, ib)
+                    if v >= bv and wh >= RESCUE_WHITE:
+                        best, src, bv = c, "candidate", v
+                if other[t] is not None and overlap_small(best, other[t]) > OVERLAP_MAX:
+                    continue
+                out.setdefault(t, []).append((side, best, src))
+            k = e
+    return out

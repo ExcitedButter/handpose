@@ -38,6 +38,14 @@ Zhi Cao<sup>1,2*</sup>, Yining Hong<sup>2*</sup>, Jiaolong Yang<sup>3</sup>, Yej
    or disappearance of a hand. Because the search sees the whole recording, a
    hand that re-enters the view is labeled from the past and the future,
    not only from the frame where it reappears.
+   **Gap rescue:** when one hand's track has a gap of at most 2 s with the
+   hand labeled on both sides (usually a partial occlusion), each sample in
+   the gap gets a box: a weak candidate or weak hand-detector box (score
+   >= 0.05) near the position interpolated between the two ends, otherwise the
+   interpolated box itself. The pose of a rescued hand is kept only if it
+   lies on the glove (skeleton on white pixels: share >= 0.6 with a detector
+   box, >= 0.85 for an interpolated box; rendered mesh covering >= 15 % of the
+   glove), is not larger than its box and has its wrist inside it.
 3. **Pose** (`pose_select.py`). AnyHand-WiLoR regresses MANO parameters, 21
    3D joints and their 2D projections for each labeled hand box at
    `--pose-hz`. The network sometimes returns the mirror-image solution (palm
@@ -237,8 +245,11 @@ re-stabilizes saved predictions and prints statistics.
   stereo pair. 3D joints are wrist-relative; absolute 3D hand position is
   not provided.
 * Hands are missed when heavily occluded, motion-blurred, at the image border
-  or out of view; those frames are `*_ok == False`. Holes up to 0.3 s are
-  interpolated, longer ones are left empty.
+  or out of view; those frames are `*_ok == False`. Gaps up to 2 s between
+  two labeled stretches are searched again (gap rescue) and filled where a
+  pose verified against the glove is found; holes up to 0.3 s are
+  interpolated, longer ones are left empty. A rescued pose of a mostly hidden
+  hand is less precise than a pose of a visible hand.
 * Labels rely on image geometry, glove appearance and motion continuity.
   Long stretches with crossed hands can be labeled the wrong way round.
 * White objects that look like a glove can be taken for a hand, especially
