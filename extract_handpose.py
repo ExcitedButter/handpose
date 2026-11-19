@@ -57,6 +57,31 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
+def load_hand_detector(device):
+    """Optional second candidate source: WiLoR's YOLO hand detector.
+
+    Used when ``ultralytics`` is installed and the weights exist at
+    ``$HANDPOSE_HAND_DETECTOR`` or ``<weights>/wilor/detector.pt``; otherwise
+    labeling uses YOLO-World candidates only.
+    """
+    path = os.environ.get("HANDPOSE_HAND_DETECTOR")
+    if not path:
+        root = os.environ.get("HANDPOSE_WEIGHTS") or str(Path(__file__).resolve().parent / "weights")
+        path = str(Path(root) / "wilor" / "detector.pt")
+    if not Path(path).is_file():
+        print("Hand detector not found; using YOLO-World candidates only", flush=True)
+        return None
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        print("ultralytics not installed; using YOLO-World candidates only", flush=True)
+        return None
+    model = YOLO(path)
+    model.to(device)
+    print(f"Hand detector: {path}", flush=True)
+    return model
+
+
 def arm_check(preds, frame_wh):
     """Consistency of left/right labels with the forearm direction.
 
@@ -112,6 +137,7 @@ class Pipeline:
         # Same weights, prompted with shoe classes too: scores boxes that look more like a shoe than a glove.
         self.shoe_detector = YOLOWorldDetector(device=device, prompts=("white glove", "hand") + labeling.SHOE_PROMPTS)
         self.extractor = WiLoRPoseExtractor(device=device, fp16=args.fp16)
+        self.hand_detector = load_hand_detector(device)
 
     def run(self, src, output, save_predictions=None):
         from mcap_video import FrameSampler, iter_left_frames
@@ -166,7 +192,8 @@ class Pipeline:
             if sampler is not None and not sampler.select(frame.offset_s):
                 continue
             boxes, scores, whites, shoes = labeling.detect_candidates(self.detector, frame.image, scale=det_scale,
-                                                                      shoe_detector=self.shoe_detector)
+                                                                      shoe_detector=self.shoe_detector,
+                                                                      hand_detector=self.hand_detector)
             keys.append(key); times.append(frame.offset_s)
             cand_boxes.append(boxes); cand_scores.append(scores); cand_whites.append(whites); cand_shoes.append(shoes)
         if not seen_times:

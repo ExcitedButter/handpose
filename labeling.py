@@ -17,6 +17,10 @@ optionally absent. The cost of a path combines:
 * shoe-likeness: white sneakers look like gloves to the glove/hand prompts.
   The same detector is also queried with "shoe"/"sneaker" prompts; a box that
   scores clearly higher as a shoe than as a glove is penalized;
+* optional second detector: when WiLoR's YOLO hand detector is installed,
+  its confident boxes that no YOLO-World candidate covers are added as weak
+  candidates (they mostly recover a hand next to the other hand, or a glove
+  holding a shoe); their handedness output is not used;
 * births and deaths of a hand cost a constant, so short detector misses are
   bridged by the stabilizer instead of producing label changes.
 
@@ -46,10 +50,13 @@ WHITE_MIN = 0.35        # white-pixel share below which a box is penalized (v7: 
 WHITE_PEN = 3.0         # penalty for a box with no white pixels at all
 WHITE_S, WHITE_V = 60, 110   # HSV thresholds of a white pixel (OpenCV scale)
 SHOE_PROMPTS = ("shoe", "sneaker")
+HAND_DET_CONF = 0.3     # extra candidates: hand-detector boxes at least this confident ...
+HAND_DET_SCALE = 0.3    # ... enter with this fraction of their confidence as score
+HAND_DET_MAX = 3        # ... at most this many per frame
 SHOE_MATCH = 0.5        # IoU for a shoe-query box to describe a candidate
 SHOE_MARGIN = 0.15      # shoe score minus glove score where the penalty starts
 SHOE_RANGE = 0.25       # ... and over which it ramps up to SHOE_PEN
-SHOE_PEN = 6.0          # penalty for a box that is clearly a shoe
+SHOE_PEN = 3.0          # penalty for a box that is clearly a shoe (v10: 6 -> 3, so a glove holding a shoe is kept)
 
 
 def area(b):
@@ -115,7 +122,26 @@ def shoe_scores(shoe_detector, image, boxes):
     return out
 
 
-def detect_candidates(detector, image, scale=1.0, shoe_detector=None):
+def hand_detector_boxes(hand_detector, image, rows):
+    """Boxes of the optional hand detector (WiLoR's YOLO hand detector) that no
+    candidate in ``rows`` covers (IoU <= 0.5), as rows [x0, y0, x1, y1, score]."""
+    if hand_detector is None:
+        return []
+    r = hand_detector.predict(image, conf=HAND_DET_CONF, verbose=False)[0]
+    if not len(r.boxes):
+        return []
+    out = []
+    det = sorted(zip(r.boxes.xyxy.cpu().numpy().tolist(), r.boxes.conf.cpu().numpy().tolist()), key=lambda d: -d[1])
+    for b, c in det:
+        if any(iou(b, o) > .5 for o in rows + out):
+            continue
+        out.append([float(v) for v in b] + [HAND_DET_SCALE * float(c)])
+        if len(out) >= HAND_DET_MAX:
+            break
+    return out
+
+
+def detect_candidates(detector, image, scale=1.0, shoe_detector=None, hand_detector=None):
     """Candidate hand boxes on one frame, in coordinates multiplied by ``scale``.
 
     Returns ``(boxes, scores, whites, shoes)``; ``whites`` is the white-pixel
@@ -126,6 +152,9 @@ def detect_candidates(detector, image, scale=1.0, shoe_detector=None):
     boxes, two overlapping halves are queried at higher effective resolution.
     Boxes that cover two other candidates (both hands merged in one box) are
     dropped.
+        With ``hand_detector`` (an ultralytics YOLO hand detector), up to
+    ``HAND_DET_MAX`` of its boxes that no candidate covers are appended with
+    score ``HAND_DET_SCALE`` x confidence (see :func:`hand_detector_boxes`).
     """
     h, w = image.shape[:2]
     rows = [list(map(float, r[:5])) for r in detector.predict(image, conf=CONF, iou=.5)]
@@ -141,9 +170,12 @@ def detect_candidates(detector, image, scale=1.0, shoe_detector=None):
         if len(inside) >= 2 and overlap_small(inside[0], inside[1]) < .5:
             merged.append(r)
     rows = [r for r in rows if r not in merged][:MAX_CANDIDATES]
-    whites = [whiteness(image, r[:4]) for r in rows]
-    shoes = shoe_scores(shoe_detector, image, [r[:4] for r in rows])
-    return [np.array(r[:4], np.float32) * scale for r in rows], [r[4] for r in rows], whites, list(shoes)
+    extra = hand_detector_boxes(hand_detector, image, rows)
+    whites = [whiteness(image, r[:4]) for r in rows + extra]
+    # Hand-detector boxes get no shoe score: they mostly recover a glove holding a shoe.
+    shoes = list(shoe_scores(shoe_detector, image, [r[:4] for r in rows])) + [0.] * len(extra)
+    rows = rows + extra
+    return [np.array(r[:4], np.float32) * scale for r in rows], [r[4] for r in rows], whites, shoes
 
 
 def _bonus(score):

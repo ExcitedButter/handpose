@@ -23,7 +23,11 @@ Zhi Cao<sup>1,2*</sup>, Yining Hong<sup>2*</sup>, Jiaolong Yang<sup>3</sup>, Yej
    score: the same YOLO-World weights are queried once more on the full view
    with the prompts "white glove", "hand", "shoe", "sneaker", and the
    candidate gets the shoe score minus the glove score of the overlapping
-   prediction (white sneakers otherwise pass as gloves).
+   prediction (white sneakers otherwise pass as gloves). Optionally, WiLoR's
+   YOLO hand detector also runs on the frame; up to three of its confident
+   boxes (score >= 0.3) that no YOLO-World candidate covers are added as weak
+   candidates. They mostly recover a hand right next to the other hand or a
+   glove holding a shoe. Its left/right output is not used.
 2. **Hand labels** (`labeling.py`, offline). All candidates of the recording
    are labeled at once by a Viterbi search over per-frame assignments
    (left box, right box), each possibly absent. The path cost rewards
@@ -71,6 +75,14 @@ uses CSRT tracking from the contrib build. Install the PyTorch build that
 matches your hardware first if you want GPU inference. On a GPU with `--fp16`
 we measured about 15 video frames/s per process (four pose hypotheses per
 hand); CPU works but is much slower.
+
+Optional, for the second candidate detector (recommended; it recovers hands the
+glove detector misses): `pip install ultralytics==8.3.40` and place WiLoR's
+hand detector weights (`detector.pt` from the
+[WiLoR release](https://huggingface.co/spaces/rolpotamias/WiLoR/tree/main/pretrained_models))
+at `weights/wilor/detector.pt`, or point `HANDPOSE_HAND_DETECTOR` to it.
+Note that ultralytics is AGPL-3.0 licensed. Without it the pipeline runs as
+before with YOLO-World candidates only.
 
 ## 2. Model weights
 
@@ -231,9 +243,9 @@ re-stabilizes saved predictions and prints statistics.
   Long stretches with crossed hands can be labeled the wrong way round.
 * White objects that look like a glove can be taken for a hand, especially
   while the real hand is occluded or out of view. White sneakers are
-  recognized by the shoe score and rejected; when a glove holds a shoe and one
-  box covers both, that hand may be dropped for a few frames rather than
-  mislabeled.
+  recognized by the shoe score and penalized; the penalty is moderate, so a
+  glove holding a shoe (one box covering both) is usually kept, and a bare
+  shoe can occasionally be labeled as a hand for a few frames.
 * The detector is prompted for white gloves; bare hands or other gloves are
   detected less reliably.
 * Detector scores are not joint confidences.
