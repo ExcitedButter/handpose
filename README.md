@@ -60,6 +60,22 @@ Zhi Cao<sup>1,2*</sup>, Yining Hong<sup>2*</sup>, Jiaolong Yang<sup>3</sup>, Yej
    toward the head camera (graded, so edge-on hands are not forced either
    way), and penalizes changes of hand shape, wrist jumps and clear palm flips
    between samples.
+   **Consistency check:** the first three hypotheses describe the same hand
+   with the same handedness, so on a visible hand they agree. When they
+   scatter (largest median keypoint distance between two of them above 0.5
+   hand sizes) or one of them leaves the glove (glove share below 0.2), the
+   box usually holds no visible hand: a hand hidden under a cloth, a hand cut
+   off by the frame edge, a knee or forearm. Such a pose is dropped unless one
+   hypothesis lies clearly on the glove (share >= 0.6), or the hypotheses
+   agree closely (within 0.15 hand sizes) and the best one still touches the
+   glove (share >= 0.1; beige gloves and paper held over the glove give low
+   shares). Set `HANDPOSE_CONSIST_REJECT=0` to keep every pose.
+   **Frame check:** after the hypothesis choice, a pose with five or more of
+   its 21 keypoints outside the image is dropped. Such a pose is mostly
+   extrapolated where nothing can be checked; in practice it is a hand largely
+   cut off by the frame edge with invented fingers, or a skeleton placed next
+   to a hand that is just outside the view. A hand whose wrist alone is past
+   the edge is kept.
 4. **Stabilization** (`stabilize.py`, offline, zero phase). Drop detections
    with score below 0.05; reject poses whose wrist lies outside the hand's own
    box (more than 0.6 box diagonals from its center; a box that touches the
@@ -94,18 +110,7 @@ before with YOLO-World candidates only.
 
 ## 2. Model weights
 
-The weights are not stored in this GitHub repository. Download them from the
-[EgoForce dataset on Hugging Face](https://huggingface.co/datasets/zhicao/EgoForce/tree/main/handpose_algorithm/weights)
-into `weights/` (about 2.9 GB, everything except MANO):
-
-```bash
-pip install -U huggingface_hub
-hf download zhicao/EgoForce --repo-type dataset \
-    --include "handpose_algorithm/weights/*" --local-dir hf_egoforce
-cp -r hf_egoforce/handpose_algorithm/weights/. weights/
-```
-
-The resulting layout:
+All weights except MANO ship with this folder:
 
 ```text
 weights/
@@ -249,7 +254,17 @@ re-stabilizes saved predictions and prints statistics.
   two labeled stretches are searched again (gap rescue) and filled where a
   pose verified against the glove is found; holes up to 0.3 s are
   interpolated, longer ones are left empty. A rescued pose of a mostly hidden
-  hand is less precise than a pose of a visible hand.
+  hand is less precise than a pose of a visible hand. A hand that is covered
+  (for example by a cloth it is holding) is usually dropped by the consistency
+  check rather than given a guessed pose, so such stretches stay empty.
+  Likewise a hand that is largely outside the frame (five or more keypoints
+  past the image edge) is left empty rather than extrapolated.
+* Grasps of tools (hammer, screwdriver, glasses frame), fingers hidden by an
+  object and hands very close to the camera often get a plausible but rough
+  finger pose; the wrist position and overall hand orientation are more
+  reliable than individual finger joints.
+* Small, distant gloves (about 50 px wide in the native left view) can be
+  missed by both detectors.
 * Labels rely on image geometry, glove appearance and motion continuity.
   Long stretches with crossed hands can be labeled the wrong way round.
 * White objects that look like a glove can be taken for a hand, especially
@@ -257,6 +272,10 @@ re-stabilizes saved predictions and prints statistics.
   recognized by the shoe score and penalized; the penalty is moderate, so a
   glove holding a shoe (one box covering both) is usually kept, and a bare
   shoe can occasionally be labeled as a hand for a few frames.
+  A white table top is the hardest case: with the real hand just below the
+  frame, a phantom hand can be placed on the table next to the visible one
+  for long stretches. The frame check removes the poses of it that reach
+  past the image edge, not the ones that lie fully inside.
 * The detector is prompted for white gloves; bare hands or other gloves are
   detected less reliably.
 * Detector scores are not joint confidences.

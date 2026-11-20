@@ -45,7 +45,16 @@ RESCUE_GLOVE = 0.6
 RESCUE_GLOVE_INTERP = 0.85  # stricter when no detector box was found at all (interpolated box)
 RESCUE_COVER = 0.15
 RESCUE_MAX_EXT = 1.0
-RESCUE_SCORE = 0.1      # detector score given to a rescued hand (stabilize.MIN_SCORE is 0.05)
+RESCUE_SCORE = 0.1
+CONSIST_HYPS = (0, 1, 2)       # box, refit and rotated hypotheses: same hand, same handedness
+CONSIST_REJECT = os.environ.get("HANDPOSE_CONSIST_REJECT", "1") == "1"
+CONSIST_GLOVE = 0.2            # a pose whose weakest hypothesis has less glove evidence than this ...
+CONSIST_SPREAD = 0.5           # ... or whose hypotheses disagree by more than this (share of hand size) ...
+CONSIST_BEST = 0.6             # ... is dropped unless its best hypothesis has at least this much glove evidence,
+CONSIST_STABLE = 0.15          # ... or its hypotheses agree this closely (beige gloves, paper over the glove) ...
+MIN_INSIDE = 0.8               # share of the 21 keypoints that must lie inside the image (at most 4 outside)
+CONSIST_FLOOR = 0.1            # ... and the best one still touches the glove (not a hand hidden under cloth)
+      # detector score given to a rescued hand (stabilize.MIN_SCORE is 0.05)
 
 
 def parse_args(argv=None):
@@ -65,6 +74,36 @@ def parse_args(argv=None):
     p.add_argument("--save-predictions", type=Path, default=None, help="Single mode: also write raw per-pose predictions (.jsonl.gz)")
     p.add_argument("--overwrite", action="store_true", help="Batch mode: recompute recordings whose output exists")
     return p.parse_args(argv)
+
+
+def consistency(kp2, glove):
+    """Agreement of the same-handedness hypotheses of one hand.
+
+    Returns (glove point share of each of the ``CONSIST_HYPS`` hypotheses, largest
+    median keypoint distance between two of them divided by the hand size).  On a
+    real glove the hypotheses agree and all lie on white pixels; on a box that holds
+    no visible hand (covered by cloth, cut off by the frame edge, a knee) they
+    scatter and some leave the glove.
+    """
+    k = kp2[list(CONSIST_HYPS)]
+    size = max(float(np.ptp(k[0][:, 0])), float(np.ptp(k[0][:, 1])), 1.0)
+    spread = max(float(np.median(np.linalg.norm(k[a] - k[b], axis=-1)))
+                 for a in range(len(k)) for b in range(a + 1, len(k))) / size
+    return [round(float(g), 3) for g in glove[list(CONSIST_HYPS), 0]], round(spread, 3)
+
+
+def inside_share(kp2, wh):
+    """Share of keypoints inside the image. A pose whose keypoints run past the
+    frame edge is extrapolated where nothing can be checked; such poses are
+    mostly a hand cut off by the frame, or a skeleton placed next to a hand
+    that is just outside the view."""
+    return float(((kp2[:, 0] >= 0) & (kp2[:, 0] < wh[0]) & (kp2[:, 1] >= 0) & (kp2[:, 1] < wh[1])).mean())
+
+
+def consistent(hand):
+    g, spread = hand["hyp_glove"], hand["hyp_spread"]
+    return (max(g) >= CONSIST_BEST or (min(g) >= CONSIST_GLOVE and spread <= CONSIST_SPREAD)
+            or (spread <= CONSIST_STABLE and max(g) >= CONSIST_FLOOR))
 
 
 def load_hand_detector(device):
@@ -225,6 +264,7 @@ class Pipeline:
         rescue = labeling.rescue_gaps(lab, np.asarray(times), cand_boxes, cand_whites, cand_spare)
         accept_all = os.environ.get("HANDPOSE_RESCUE_ACCEPT_ALL") == "1"   # calibration only
         rescue_stats = {"tried": 0, "kept": 0, "kept_candidate": 0}
+        consist_stats = {"dropped": 0, "outside": 0}
 
         # Pass 2: pose hypotheses for the labeled boxes (pose_select.py).
         wanted = {key: k for k, key in enumerate(keys)}
@@ -245,6 +285,7 @@ class Pipeline:
             for i, (hand, sc) in enumerate(zip(base, score)):
                 hand["detector_score"] = sc
                 hand["evidence"] = glove[i].max(0).tolist()
+                hand["hyp_glove"], hand["hyp_spread"] = consistency(kp2[i], glove[i])
                 if origin[i] is not None:
                     rescue_stats["tried"] += 1
                     g_min = RESCUE_GLOVE if origin[i] == "candidate" else RESCUE_GLOVE_INTERP
@@ -255,6 +296,9 @@ class Pipeline:
                         continue
                     rescue_stats["kept"] += int(ok)
                     rescue_stats["kept_candidate"] += int(ok and origin[i] == "candidate")
+                if CONSIST_REJECT and origin[i] is None and not consistent(hand):
+                    consist_stats["dropped"] += 1
+                    continue
                 track[right[i]][k] = (kp2[i], kp3[i], glove[i], hand)
             rows[k] = frame.offset_s
         # Offline choice of one hypothesis per sample, per hand and per run of consecutive samples.
@@ -271,6 +315,9 @@ class Pipeline:
                                        np.stack([samples[k][2] for k in run]), bool(side))
                 for k, h in zip(run, c):
                     kp2, kp3, _, hand = samples[k]
+                    if inside_share(kp2[h], frame_wh) < MIN_INSIDE:
+                        consist_stats["outside"] += 1
+                        continue
                     hand = dict(hand, keypoints_2d=kp2[h], joints_3d=kp3[h], hypothesis=int(h))
                     chosen.setdefault(k, []).append(hand)
         preds = [(rows[k], {"offset_s": rows[k], "hands": chosen.get(k, [])}) for k in sorted(rows)]
@@ -293,7 +340,7 @@ class Pipeline:
             def plain(v):
                 return v.tolist() if isinstance(v, np.ndarray) else (v.item() if isinstance(v, np.generic) else v)
             keep = ("right", "track_id", "detector_score", "keypoints_2d", "joints_3d", "cam_t", "bbox", "hypothesis",
-                    "evidence", "rescued")
+                    "evidence", "rescued", "hyp_glove", "hyp_spread")
             with gzip.open(save_predictions, "wt") as f:
                 for _, row in preds:
                     hands = [{k: plain(v) for k, v in h.items() if k in keep} for h in row["hands"]]
@@ -302,7 +349,7 @@ class Pipeline:
         return {"input": str(src), "frames": len(frame_times), "poses": len(preds),
                 "elapsed_s": round(time.perf_counter() - started, 1),
                 "coverage_L": round(float(arrs["L_ok"].mean()), 4), "coverage_R": round(float(arrs["R_ok"].mean()), 4),
-                "labeling": lab.stats, "gap_rescue": rescue_stats,
+                "labeling": lab.stats, "gap_rescue": rescue_stats, "consistency": consist_stats,
                 "pose_hypotheses_chosen": dict(zip(("box", "refit", "rotated", "mirror_alt"), map(int, hyp_counts))),
                 "arm_check": arm_check(preds, frame_wh), "stabilizer": stats, "output": str(output)}
 
